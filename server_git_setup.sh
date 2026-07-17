@@ -11,7 +11,10 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 apt-get update
-apt-get install -y git docker.io docker-compose-plugin
+apt-get install -y git docker.io
+if ! apt-get install -y docker-compose-plugin; then
+  apt-get install -y docker-compose
+fi
 systemctl enable --now docker
 
 if [[ ! -d "${APP_DIR}/.git" ]]; then

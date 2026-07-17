@@ -9,9 +9,18 @@ if [[ ! -f .env ]]; then
   exit 1
 fi
 
-docker compose build --pull
-docker compose up -d --remove-orphans
-docker compose ps
+if docker compose version >/dev/null 2>&1; then
+  COMPOSE="docker compose"
+elif command -v docker-compose >/dev/null 2>&1; then
+  COMPOSE="docker-compose"
+else
+  echo "Docker Compose is not installed"
+  exit 1
+fi
+
+${COMPOSE} build --pull
+${COMPOSE} up -d --remove-orphans
+${COMPOSE} ps
 curl --fail --retry 10 --retry-delay 2 http://127.0.0.1:4173/api/health
 
 echo
