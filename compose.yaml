@@ -1,0 +1,22 @@
+services:
+  wb-autofund:
+    build: .
+    container_name: wb-autofund
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:4173:4173"
+    volumes:
+      - wb_autofund_data:/app/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  wb_autofund_data:

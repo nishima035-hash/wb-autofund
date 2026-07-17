@@ -1,0 +1,28 @@
+let state={},query='';
+const $=s=>document.querySelector(s);
+const money=n=>new Intl.NumberFormat('ru-RU',{style:'currency',currency:'RUB',maximumFractionDigits:0}).format(n||0);
+const number=n=>new Intl.NumberFormat('ru-RU').format(Math.round(n||0));
+const date=s=>`${new Intl.DateTimeFormat('ru-RU',{timeZone:'Europe/Moscow',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit',second:'2-digit'}).format(new Date(s))} МСК`;
+async function request(path,options={}){const r=await fetch(path,{headers:{'content-type':'application/json'},...options}),j=await r.json();if(!r.ok)throw new Error(j.error||'Ошибка');return j}
+async function load(){state=await request('/api/dashboard');render()}
+function render(){
+  const cs=state.campaigns.filter(c=>!query||c.name.toLowerCase().includes(query)||String(c.id).includes(query));
+  const spend=state.campaigns.reduce((s,c)=>s+Number(c.spend||0),0),revenue=state.campaigns.reduce((s,c)=>s+Number(c.revenue||0),0),avgCtr=state.campaigns.length?state.campaigns.reduce((s,c)=>s+Number(c.ctr||0),0)/state.campaigns.length:0;
+  $('#stats').innerHTML=`<div class="stat"><span>Сумма заказов</span><b>${money(revenue)}</b></div><div class="stat"><span>Затраты</span><b>${money(spend)}</b></div><div class="stat"><span>Доля затрат</span><b>${revenue?(spend/revenue*100).toFixed(2):0}%</b></div><div class="stat"><span>CTR</span><b>${avgCtr.toFixed(2)}%</b></div>`;
+  $('#mode').textContent=state.settings.demo_mode?'Демо-режим':'Подключено к WB';$('#shown').textContent=cs.length;
+  $('#campaignRows').innerHTML=cs.map((c,i)=>{const impressions=Math.round((c.spend||500)*(1.7+i*.35));const summary=c.enabled?`${c.use_time_window?`${c.time_from}–${c.time_to} МСК`:'24 часа'}`:'Правило выключено';return `<tr><td><span class="status ${c.status}">${c.status==='active'?'Активна':'Приостановлена'}</span></td><td><span class="campaign-name">${esc(c.name)}</span><span class="campaign-meta">ID ${c.id}</span></td><td>CPC</td><td><span class="money">${money(c.budget)}</span></td><td>${money(c.spend)}</td><td>${number(impressions)}</td><td><b class="metric ${!c.use_min_ctr||c.ctr>=c.min_ctr?'good':'bad'}">${c.ctr}%</b></td><td><b class="metric ${!c.use_max_drr||c.drr<=c.max_drr?'good':'bad'}">${c.drr}%</b></td><td><span class="toggle ${c.enabled?'on':''}"></span><span class="rule-summary">${summary}</span></td><td><button onclick="openRule(${c.id})">Настроить</button></td></tr>`}).join('');
+  $('#logs').innerHTML=state.operations.length?state.operations.map(o=>`<div class="log"><span class="sub">${date(o.created_at)}</span><div><b>${esc(o.campaign_name)}</b><div class="sub">${esc(o.reason||'')}</div></div><b class="status-${o.status}">${o.status==='deposited'?'Пополнено '+money(o.amount):o.status==='error'?'Ошибка':'Не пополнено'}</b></div>`).join(''):'<p>Журнал пока пуст.</p>';
+  $('#demo').checked=!!state.settings.demo_mode;$('#interval').value=state.settings.check_minutes;$('#token').placeholder=state.settings.token_saved?'Токен сохранён ••••••••':'Вставьте токен WB';
+}
+window.openRule=id=>{const c=state.campaigns.find(x=>x.id===id);$('#campaignId').value=id;$('#ruleTitle').textContent=c.name;$('#ruleId').textContent=`Кампания ID ${c.id}`;$('#enabled').checked=!!c.enabled;$('#useMaxDrr').checked=c.use_max_drr==null?true:!!c.use_max_drr;$('#useMinCtr').checked=c.use_min_ctr==null?true:!!c.use_min_ctr;$('#useTimeWindow').checked=!!c.use_time_window;$('#timeFrom').value=c.time_from??'00:00';$('#timeTo').value=c.time_to??'23:59';$('#maxDrr').value=c.max_drr??12;$('#minCtr').value=c.min_ctr??2;$('#minBudget').value=c.min_budget??500;$('#amount').value=c.deposit_amount??1000;$('#limit').value=c.daily_limit??3;$('#funding').value=c.funding_type??1;$('#ruleDialog').showModal()};
+$('#close').onclick=$('#cancel').onclick=()=>$('#ruleDialog').close();
+$('#ruleForm').onsubmit=async e=>{e.preventDefault();const id=$('#campaignId').value;await act(`/api/campaigns/${id}/rule`,{method:'PUT',body:JSON.stringify({enabled:$('#enabled').checked,use_max_drr:$('#useMaxDrr').checked,max_drr:$('#maxDrr').value,use_min_ctr:$('#useMinCtr').checked,min_ctr:$('#minCtr').value,use_time_window:$('#useTimeWindow').checked,time_from:$('#timeFrom').value,time_to:$('#timeTo').value,min_budget:$('#minBudget').value,deposit_amount:$('#amount').value,daily_limit:$('#limit').value,funding_type:$('#funding').value})},'Правило сохранено');$('#ruleDialog').close()};
+$('#search').oninput=e=>{query=e.target.value.trim().toLowerCase();render()};
+$('#run').onclick=async()=>{const x=await act('/api/run',{method:'POST',body:'{}'});toast(`Проверено: ${x.checked}, пополнено: ${x.deposited}`)};
+$('#sync').onclick=()=>act('/api/sync',{method:'POST',body:'{}'},'Кампании обновлены');
+$('#saveSettings').onclick=()=>act('/api/settings',{method:'POST',body:JSON.stringify({token:$('#token').value,demo_mode:$('#demo').checked,check_minutes:$('#interval').value})},'Настройки сохранены');
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');document.querySelectorAll('main>.panel').forEach(x=>x.classList.add('hidden'));$('#'+b.dataset.tab).classList.remove('hidden')});
+async function act(path,opt,msg){try{const x=await request(path,opt);if(msg)toast(msg);await load();return x}catch(e){toast(e.message);throw e}}
+function toast(s){const x=$('#toast');x.textContent=s;x.classList.add('show');setTimeout(()=>x.classList.remove('show'),3000)}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+load();

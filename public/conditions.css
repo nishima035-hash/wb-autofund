@@ -1,0 +1,6 @@
+.condition{border:1px solid var(--line);border-radius:11px;padding:12px;margin-bottom:15px}
+.condition label:last-child{margin-bottom:0}
+.condition-title{flex-direction:row;align-items:center;color:var(--ink);font-size:14px;font-weight:700}
+.condition:has(.condition-title input:not(:checked)) label:last-child{opacity:.45}
+.condition:has(.condition-title input:not(:checked)) input[type=number]{background:var(--soft)}
+.time-condition{grid-column:1/-1}.time-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.time-row label{margin:0}.condition:has(.condition-title input:not(:checked)) input[type=time]{background:var(--soft)}

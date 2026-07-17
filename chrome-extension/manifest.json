@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "WB AutoFund",
+  "version": "1.0.0",
+  "description": "Быстрый доступ к панели автопополнения рекламных кампаний Wildberries.",
+  "permissions": ["storage"],
+  "action": {
+    "default_title": "WB AutoFund",
+    "default_popup": "popup.html"
+  }
+}
