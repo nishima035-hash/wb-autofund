@@ -43,7 +43,10 @@ migrateColumn('rules','min_views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','use_min_orders','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','min_orders','INTEGER NOT NULL DEFAULT 0');
 seedDemo();
-importDiaryData();
+// A large Diary archive can contain hundreds of thousands of rows. Importing it
+// synchronously before listen() makes Docker health checks fail with a 502.
+// Enable the one-off import explicitly after the web service is known to start.
+if(process.env.IMPORT_DIARY_ON_START==='true') importDiaryData();
 
 const mime = {'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml'};
 const server = http.createServer(async (req,res) => {
