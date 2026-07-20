@@ -9,6 +9,7 @@ services:
       - "127.0.0.1:4173:4173"
     volumes:
       - wb_autofund_data:/app/data
+      - ${DIARY_SOURCE_DIR:-/opt/marketplace-diary}:/diary-data:ro
     security_opt:
       - no-new-privileges:true
     cap_drop:

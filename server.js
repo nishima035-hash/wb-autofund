@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS campaigns (id INTEGER PRIMARY KEY, name TEXT NOT NULL
 CREATE TABLE IF NOT EXISTS rules (campaign_id INTEGER PRIMARY KEY REFERENCES campaigns(id) ON DELETE CASCADE, enabled INTEGER NOT NULL DEFAULT 0, max_drr REAL NOT NULL, min_ctr REAL NOT NULL, min_budget REAL NOT NULL, deposit_amount INTEGER NOT NULL, daily_limit INTEGER NOT NULL, funding_type INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS operations (id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER NOT NULL, campaign_name TEXT NOT NULL, created_at TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, amount INTEGER NOT NULL DEFAULT 0, budget_before REAL, budget_after REAL, ctr REAL, drr REAL, idempotency_key TEXT UNIQUE);
 CREATE TABLE IF NOT EXISTS locks (campaign_id INTEGER PRIMARY KEY, locked_until TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS hourly_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER NOT NULL, campaign_name TEXT, status TEXT, snapshot_at TEXT NOT NULL, impressions_total INTEGER, clicks_total INTEGER, quality TEXT NOT NULL DEFAULT 'ok', note TEXT, UNIQUE(campaign_id,snapshot_at));
+CREATE TABLE IF NOT EXISTS campaign_daily_stats (campaign_id INTEGER NOT NULL, stat_date TEXT NOT NULL, views INTEGER NOT NULL DEFAULT 0, clicks INTEGER NOT NULL DEFAULT 0, orders INTEGER NOT NULL DEFAULT 0, spend REAL NOT NULL DEFAULT 0, revenue REAL NOT NULL DEFAULT 0, ctr REAL NOT NULL DEFAULT 0, drr REAL NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, PRIMARY KEY(campaign_id,stat_date));
+CREATE TABLE IF NOT EXISTS sync_history (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, campaigns INTEGER NOT NULL DEFAULT 0, message TEXT);
 INSERT OR IGNORE INTO settings(id,demo_mode,check_minutes,updated_at) VALUES(1,1,5,datetime('now'));`);
 migrateColumn('rules','use_max_drr','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('rules','use_min_ctr','INTEGER NOT NULL DEFAULT 1');
@@ -26,6 +29,7 @@ migrateColumn('rules','use_time_window','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','time_from','TEXT NOT NULL DEFAULT \'00:00\'');
 migrateColumn('rules','time_to','TEXT NOT NULL DEFAULT \'23:59\'');
 migrateColumn('settings','stats_days','INTEGER NOT NULL DEFAULT 7');
+migrateColumn('settings','auto_sync_enabled','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('campaigns','views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('campaigns','metrics_available','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('campaigns','metrics_from','TEXT');
@@ -36,6 +40,7 @@ migrateColumn('rules','min_views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','use_min_orders','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','min_orders','INTEGER NOT NULL DEFAULT 0');
 seedDemo();
+importDiaryData();
 
 const mime = {'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml'};
 const server = http.createServer(async (req,res) => {
@@ -56,13 +61,15 @@ async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
     const campaigns=db.prepare(`SELECT c.*,r.enabled,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' ORDER BY c.id`).all();
     const operations=db.prepare(`SELECT * FROM operations ORDER BY id DESC LIMIT 100`).all();
-    const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
+    const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,auto_sync_enabled,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
     return send(res,200,{campaigns,operations,settings:{...s,live_deposits:process.env.WB_LIVE_DEPOSITS==='true'}});
   }
+  if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyData(url.searchParams.get('campaign_id'),url.searchParams.get('week')));
+  if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsData(url.searchParams.get('from'),url.searchParams.get('to')));
   if (req.method==='POST' && url.pathname==='/api/settings') {
     const current=db.prepare('SELECT * FROM settings WHERE id=1').get();
     const token=typeof body.token==='string'&&body.token.trim()?encrypt(body.token.trim()):current.token_enc;
-    db.prepare('UPDATE settings SET token_enc=?,demo_mode=?,check_minutes=?,stats_days=?,updated_at=? WHERE id=1').run(token,body.demo_mode?1:0,clamp(body.check_minutes,1,60),clamp(body.stats_days ?? current.stats_days ?? 7,1,31),now());
+    db.prepare('UPDATE settings SET token_enc=?,demo_mode=?,check_minutes=?,stats_days=?,auto_sync_enabled=?,updated_at=? WHERE id=1').run(token,body.demo_mode?1:0,clamp(body.check_minutes,1,1440),clamp(body.stats_days ?? current.stats_days ?? 7,1,31),body.auto_sync_enabled===false?0:1,now());
     return send(res,200,{ok:true});
   }
   const ruleMatch=url.pathname.match(/^\/api\/campaigns\/(\d+)\/rule$/);
@@ -166,13 +173,23 @@ async function syncStatistics(token, ids, days) {
     const batch=ids.slice(offset,offset+50);
     if (offset) await new Promise(resolve=>setTimeout(resolve,20500));
     const stats=await wb(`/adv/v3/fullstats?ids=${batch.join(',')}&beginDate=${beginDate}&endDate=${endDate}`,token);
-    for (const item of Array.isArray(stats)?stats:[]) {
+    const statItems=Array.isArray(stats)?stats:(Array.isArray(stats?.data)?stats.data:(Array.isArray(stats?.adverts)?stats.adverts:[]));
+    for (const item of statItems) {
       const id=Number(item.advertId || item.advert_id || item.id); if (!id) continue;
       const spend=Number(item.sum||0),revenue=Number(item.sum_price||0),views=Math.round(Number(item.views||0)),orders=Math.round(Number(item.orders||0));
       const ctr=Number.isFinite(Number(item.ctr))?Number(item.ctr):(views?Number(item.clicks||0)/views*100:0);
       // Spend without attributed orders must never look like an excellent 0% DRR.
       const drr=revenue>0?spend/revenue*100:(spend>0?999999:0);
       db.prepare(`UPDATE campaigns SET ctr=?,drr=?,spend=?,revenue=?,views=?,orders=?,metrics_available=1,metrics_from=?,metrics_to=?,updated_at=? WHERE id=?`).run(ctr,drr,spend,revenue,views,orders,beginDate,endDate,now(),id);
+      const days=Array.isArray(item.days)?item.days:[];
+      for(const day of days){
+        const statDate=String(day.date||'').slice(0,10);if(!statDate)continue;
+        const daySpend=Number(day.sum||0),dayRevenue=Number(day.sum_price||0),dayViews=Math.round(Number(day.views||0)),dayClicks=Math.round(Number(day.clicks||0)),dayOrders=Math.round(Number(day.orders||0));
+        const dayCtr=Number.isFinite(Number(day.ctr))?Number(day.ctr):(dayViews?dayClicks/dayViews*100:0),dayDrr=dayRevenue?daySpend/dayRevenue*100:(daySpend?999999:0);
+        db.prepare(`INSERT INTO campaign_daily_stats(campaign_id,stat_date,views,clicks,orders,spend,revenue,ctr,drr,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id,stat_date) DO UPDATE SET views=excluded.views,clicks=excluded.clicks,orders=excluded.orders,spend=excluded.spend,revenue=excluded.revenue,ctr=excluded.ctr,drr=excluded.drr,updated_at=excluded.updated_at`).run(id,statDate,dayViews,dayClicks,dayOrders,daySpend,dayRevenue,dayCtr,dayDrr,now());
+      }
+      const today=days.find(day=>String(day.date||'').slice(0,10)===endDate);
+      if(today){const campaign=db.prepare('SELECT name,status FROM campaigns WHERE id=?').get(id)||{};db.prepare(`INSERT OR IGNORE INTO hourly_snapshots(campaign_id,campaign_name,status,snapshot_at,impressions_total,clicks_total,quality,note) VALUES(?,?,?,?,?,?,'ok','WB API')`).run(id,campaign.name||'',campaign.status||'',moscowTimestamp(),Math.round(Number(today.views||0)),Math.round(Number(today.clicks||0)));}
     }
   }
 }
@@ -192,9 +209,22 @@ async function wb(path,token,body) {
 }
 function log(c,status,reason,amount,before,after,idem=null){db.prepare(`INSERT OR IGNORE INTO operations(campaign_id,campaign_name,created_at,action,status,reason,amount,budget_before,budget_after,ctr,drr,idempotency_key) VALUES(?, ?, ?, 'evaluation', ?, ?, ?, ?, ?, ?, ?, ?)`).run(c.campaign_id||c.id,c.name,now(),status,reason,amount,before,after,c.ctr,c.drr,idem);}
 function seedDemo(){if(db.prepare('SELECT count(*) n FROM campaigns').get().n)return;const q=db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,spend,revenue,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`);[[9134001,'Кроссовки — Поиск','active',320,7.4,8.1,8100,100000],[9134002,'Рюкзаки — Каталог','active',870,3.8,14.6,7300,50000],[9134003,'Футболки — Авто','active',190,6.2,10.9,5450,50000]].forEach(x=>q.run(...x,'demo',now()));}
+function importDiaryData(){
+  const dir=process.env.DIARY_DATA_DIR||'/diary-data';
+  const hourly=join(dir,'campaign_hourly_snapshots.csv'),stats=join(dir,'campaign_stats.csv');
+  if(existsSync(hourly))for(const r of parseCsv(readFileSync(hourly,'utf8'))){const id=Number(r.campaign_id),at=normalizeMoscowDate(r.snapshot_at);if(!id||!at)continue;db.prepare(`INSERT OR IGNORE INTO hourly_snapshots(campaign_id,campaign_name,status,snapshot_at,impressions_total,clicks_total,quality,note) VALUES(?,?,?,?,?,?,?,?)`).run(id,r.campaign_name||'',r.status||'',at,numOrNull(r.impressions_total),numOrNull(r.clicks_total),r.quality||'missing',r.quality_note||'Импортировано из Дневника');}
+  if(existsSync(stats))for(const r of parseCsv(readFileSync(stats,'utf8'))){if(r.row_type&&r.row_type!=='campaign')continue;const id=Number(r.campaign_id),date=String(r.date_to||r.date_from||'').slice(0,10);if(!id||!date)continue;const views=Number(r.impressions||0),clicks=Number(r.clicks||0),orders=Number(r.orders||0),spend=Number(r.spend||0),revenue=Number(r.revenue||0),ctr=Number(r.ctr||0),drr=Number(r.cost_share||0);db.prepare(`INSERT OR IGNORE INTO campaign_daily_stats(campaign_id,stat_date,views,clicks,orders,spend,revenue,ctr,drr,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(id,date,views,clicks,orders,spend,revenue,ctr,drr,now());}
+}
+function parseCsv(text){const rows=[];let row=[],field='',quoted=false;for(let i=0;i<text.length;i++){const c=text[i];if(c==='"'){if(quoted&&text[i+1]==='"'){field+='"';i++}else quoted=!quoted}else if(c===','&&!quoted){row.push(field);field=''}else if((c==='\n'||c==='\r')&&!quoted){if(c==='\r'&&text[i+1]==='\n')i++;row.push(field);field='';if(row.some(Boolean))rows.push(row);row=[]}else field+=c}if(field||row.length){row.push(field);rows.push(row)}if(!rows.length)return[];const headers=rows.shift().map((x,i)=>i===0?x.replace(/^\uFEFF/,''):x);return rows.map(values=>Object.fromEntries(headers.map((h,i)=>[h,values[i]??''])))}
+function hourlyData(campaignId,week){const campaigns=db.prepare(`SELECT id,name,status FROM campaigns WHERE status<>'archived' ORDER BY name`).all();const id=Number(campaignId)||Number(campaigns[0]?.id||0);const start=/^\d{4}-\d{2}-\d{2}$/.test(week||'')?week:weekMonday();const end=new Date(`${start}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+7);const rows=db.prepare(`SELECT * FROM hourly_snapshots WHERE campaign_id=? AND snapshot_at>=? AND snapshot_at<? ORDER BY snapshot_at`).all(id,`${start} 00:00:00`,`${end.toISOString().slice(0,10)} 00:00:00`);const cells=[];let previous=null,previousDay='';for(const r of rows){const day=r.snapshot_at.slice(0,10),hour=Number(r.snapshot_at.slice(11,13));let views=null,clicks=null,uncertain=r.quality!=='ok',note=r.note||'';if(previous&&previousDay===day&&r.impressions_total!=null&&previous.impressions_total!=null){views=Math.max(0,r.impressions_total-previous.impressions_total);clicks=Math.max(0,r.clicks_total-previous.clicks_total)}else if(r.impressions_total!=null){views=r.impressions_total;clicks=r.clicks_total;uncertain=true;note=note||'Первый снимок дня'}cells.push({date:day,hour,views,clicks,uncertain,note});previous=r;previousDay=day}return{campaigns,selected_id:id,week:start,cells};}
+function analyticsData(from,to){const end=to&&/^\d{4}-\d{2}-\d{2}$/.test(to)?to:ymdMoscow(new Date()),start=from&&/^\d{4}-\d{2}-\d{2}$/.test(from)?from:(()=>{const d=new Date();d.setUTCDate(d.getUTCDate()-6);return ymdMoscow(d)})();const rows=db.prepare(`SELECT d.campaign_id,COALESCE(c.name,'Кампания '||d.campaign_id) name,SUM(d.views) views,SUM(d.clicks) clicks,SUM(d.orders) orders,SUM(d.spend) spend,SUM(d.revenue) revenue,CASE WHEN SUM(d.views)>0 THEN SUM(d.clicks)*100.0/SUM(d.views) ELSE 0 END ctr,CASE WHEN SUM(d.revenue)>0 THEN SUM(d.spend)*100.0/SUM(d.revenue) ELSE 0 END drr FROM campaign_daily_stats d LEFT JOIN campaigns c ON c.id=d.campaign_id WHERE d.stat_date BETWEEN ? AND ? GROUP BY d.campaign_id,c.name ORDER BY spend DESC`).all(start,end);return{from:start,to:end,rows};}
 function migrateColumn(table,column,definition){const columns=db.prepare(`PRAGMA table_info(${table})`).all();if(!columns.some(x=>x.name===column))db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);}
 function validTime(value,fallback){return typeof value==='string'&&/^([01]\d|2[0-3]):[0-5]\d$/.test(value)?value:fallback;}
 function ymdMoscow(date){return new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit',day:'2-digit'}).format(date);}
+function moscowTimestamp(date=new Date()){const parts=new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(date);return parts.replace('T',' ')}
+function normalizeMoscowDate(value){const s=String(value||'').trim();return /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}/.test(s)?s.slice(0,19).replace('T',' '):''}
+function numOrNull(value){const n=Number(value);return value===''||!Number.isFinite(n)?null:n}
+function weekMonday(){const today=new Date(`${ymdMoscow(new Date())}T00:00:00Z`),day=(today.getUTCDay()+6)%7;today.setUTCDate(today.getUTCDate()-day);return today.toISOString().slice(0,10)}
 function isMoscowTimeAllowed(from,to,date=new Date()){const parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(date);const current=Number(parts.find(x=>x.type==='hour').value)*60+Number(parts.find(x=>x.type==='minute').value);const minutes=s=>Number(s.slice(0,2))*60+Number(s.slice(3));const start=minutes(from),end=minutes(to);return start<=end?current>=start&&current<=end:current>=start||current<=end;}
 function key(){const raw=process.env.APP_ENCRYPTION_KEY;if(!raw||!/^[a-f0-9]{64}$/i.test(raw))return createHash('sha256').update(`local-dev:${process.cwd()}`).digest();return Buffer.from(raw,'hex');}
 function encrypt(s){const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',key(),iv),data=Buffer.concat([c.update(s,'utf8'),c.final()]);return [iv,c.getAuthTag(),data].map(x=>x.toString('base64url')).join('.');}
@@ -208,7 +238,7 @@ function send(res,status,data){res.writeHead(status,{'content-type':'application
 server.listen(PORT,HOST,()=>console.log(`WB AutoFund: http://${HOST}:${PORT}`));
 let running=false,lastAutomaticRun=0;setInterval(async()=>{
   const settings=db.prepare('SELECT * FROM settings WHERE id=1').get(),minutes=settings.check_minutes;
-  if(running||Date.now()-lastAutomaticRun<minutes*60000)return;
+  if(!settings.auto_sync_enabled||running||Date.now()-lastAutomaticRun<minutes*60000)return;
   running=true;lastAutomaticRun=Date.now();
   try {
     // A closed browser must not stop automation: refresh WB data on the server
