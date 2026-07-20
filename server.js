@@ -133,6 +133,7 @@ async function syncCampaigns() {
     db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at) VALUES(?,?,?,?,0,0,'wb',?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,budget=excluded.budget,source='wb',updated_at=excluded.updated_at`).run(id,name,Number(a.status)===9?'active':'paused',Number(budget.total||0),now());
     await new Promise(resolve=>setTimeout(resolve,275));
   }
+  await new Promise(resolve=>setTimeout(resolve,1100));
   await syncStatistics(token, campaigns.map(a=>Number(a.advertId || a.advert_id || a.id)).filter(Boolean), s.stats_days || 7);
 }
 
@@ -156,8 +157,17 @@ async function syncStatistics(token, ids, days) {
 }
 
 async function wb(path,token,body) {
-  const r=await fetch(`${process.env.WB_API_BASE||'https://advert-api.wildberries.ru'}${path}`,{method:body?'POST':'GET',headers:{Authorization:token,...(body?{'content-type':'application/json'}:{})},body:body?JSON.stringify(body):undefined});
-  if (!r.ok) throw new Error(`WB API: ${r.status} ${await r.text()}`); const text=await r.text(); return text?JSON.parse(text):{};
+  const options={method:body?'POST':'GET',headers:{Authorization:token,...(body?{'content-type':'application/json'}:{})},body:body?JSON.stringify(body):undefined};
+  for (let attempt=0;attempt<4;attempt++) {
+    const r=await fetch(`${process.env.WB_API_BASE||'https://advert-api.wildberries.ru'}${path}`,options);
+    if (r.ok) { const text=await r.text(); return text?JSON.parse(text):{}; }
+    const errorText=await r.text();
+    // Only retry read operations. Retrying a deposit could charge a campaign twice.
+    if (r.status!==429 || body || attempt===3) throw new Error(`WB API: ${r.status} ${errorText}`);
+    const retryAfter=Number(r.headers.get('retry-after'));
+    const baseDelay=path.startsWith('/adv/v3/fullstats')?21000:1100;
+    await new Promise(resolve=>setTimeout(resolve,Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:baseDelay*(attempt+1)));
+  }
 }
 function log(c,status,reason,amount,before,after,idem=null){db.prepare(`INSERT OR IGNORE INTO operations(campaign_id,campaign_name,created_at,action,status,reason,amount,budget_before,budget_after,ctr,drr,idempotency_key) VALUES(?, ?, ?, 'evaluation', ?, ?, ?, ?, ?, ?, ?, ?)`).run(c.campaign_id||c.id,c.name,now(),status,reason,amount,before,after,c.ctr,c.drr,idem);}
 function seedDemo(){if(db.prepare('SELECT count(*) n FROM campaigns').get().n)return;const q=db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,spend,revenue,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`);[[9134001,'Кроссовки — Поиск','active',320,7.4,8.1,8100,100000],[9134002,'Рюкзаки — Каталог','active',870,3.8,14.6,7300,50000],[9134003,'Футболки — Авто','active',190,6.2,10.9,5450,50000]].forEach(x=>q.run(...x,'demo',now()));}
