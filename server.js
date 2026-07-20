@@ -109,11 +109,23 @@ async function syncCampaigns() {
   if (s.demo_mode) { seedDemo(); return; }
   if (!s.token_enc) throw new Error('Сначала сохраните токен WB');
   const token=decrypt(s.token_enc);
-  const groups=await wb('/api/advert/v2/adverts?statuses=7,9,11&order=change&direction=desc',token);
-  for (const group of groups || []) for (const a of group.advert_list || group.adverts || []) {
+  const response=await wb('/api/advert/v2/adverts?statuses=7,9,11&order=change&direction=desc',token);
+  const root=Array.isArray(response)?response:(Array.isArray(response?.adverts)?response.adverts:[]);
+  const campaigns=[];
+  for (const item of root) {
+    // Current v2 returns campaign objects in response.adverts. Keep support for the
+    // older grouped response so existing accounts continue to sync.
+    if (item && (item.id || item.advertId || item.advert_id)) campaigns.push(item);
+    else for (const nested of item?.advert_list || item?.adverts || []) campaigns.push({...nested,status:nested.status??item.status});
+  }
+  if (!campaigns.length) throw new Error('WB API не вернул кампании для статусов 7, 9 и 11');
+  db.prepare(`DELETE FROM campaigns WHERE source='demo'`).run();
+  for (const a of campaigns) {
     const id=Number(a.advertId || a.advert_id || a.id); if (!id) continue;
     const budget=await wb(`/adv/v1/budget?id=${id}`,token);
-    db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at) VALUES(?,?,?,?,0,0,'wb',?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,budget=excluded.budget,source='wb',updated_at=excluded.updated_at`).run(id,a.name||`Кампания ${id}`,(a.status===9||a.status===7)?'active':'paused',Number(budget.total||0),now());
+    const name=a.name || a.settings?.name || `Кампания ${id}`;
+    db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at) VALUES(?,?,?,?,0,0,'wb',?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,budget=excluded.budget,source='wb',updated_at=excluded.updated_at`).run(id,name,Number(a.status)===9?'active':'paused',Number(budget.total||0),now());
+    await new Promise(resolve=>setTimeout(resolve,275));
   }
 }
 
