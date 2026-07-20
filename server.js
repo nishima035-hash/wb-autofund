@@ -49,7 +49,7 @@ async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{status:'ok',database:'sqlite',time:now()});
   const body = ['POST','PUT','PATCH'].includes(req.method) ? await jsonBody(req) : {};
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
-    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id ORDER BY c.id`).all();
+    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' ORDER BY c.id`).all();
     const operations=db.prepare(`SELECT * FROM operations ORDER BY id DESC LIMIT 100`).all();
     const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
     return send(res,200,{campaigns,operations,settings:{...s,live_deposits:process.env.WB_LIVE_DEPOSITS==='true'}});
@@ -115,7 +115,7 @@ async function syncCampaigns() {
   if (s.demo_mode) { seedDemo(); return; }
   if (!s.token_enc) throw new Error('Сначала сохраните токен WB');
   const token=decrypt(s.token_enc);
-  const response=await wb('/api/advert/v2/adverts?statuses=7,9,11&order=change&direction=desc',token);
+  const response=await wb('/api/advert/v2/adverts?statuses=9,11&order=change&direction=desc',token);
   const root=Array.isArray(response)?response:(Array.isArray(response?.adverts)?response.adverts:[]);
   const campaigns=[];
   for (const item of root) {
@@ -124,8 +124,10 @@ async function syncCampaigns() {
     if (item && (item.id || item.advertId || item.advert_id)) campaigns.push(item);
     else for (const nested of item?.advert_list || item?.adverts || []) campaigns.push({...nested,status:nested.status??item.status});
   }
-  if (!campaigns.length) throw new Error('WB API не вернул кампании для статусов 7, 9 и 11');
   db.prepare(`DELETE FROM campaigns WHERE source='demo'`).run();
+  // Campaigns not returned for statuses 9/11 are archived. Keep their rules in
+  // the database, but hide them from the site and browser extension.
+  db.prepare(`UPDATE campaigns SET status='archived' WHERE source='wb'`).run();
   for (const a of campaigns) {
     const id=Number(a.advertId || a.advert_id || a.id); if (!id) continue;
     const budget=await wb(`/adv/v1/budget?id=${id}`,token);
