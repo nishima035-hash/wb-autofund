@@ -30,6 +30,11 @@ migrateColumn('campaigns','views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('campaigns','metrics_available','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('campaigns','metrics_from','TEXT');
 migrateColumn('campaigns','metrics_to','TEXT');
+migrateColumn('campaigns','orders','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','use_min_views','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','min_views','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','use_min_orders','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','min_orders','INTEGER NOT NULL DEFAULT 0');
 seedDemo();
 
 const mime = {'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml'};
@@ -49,7 +54,7 @@ async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{status:'ok',database:'sqlite',time:now()});
   const body = ['POST','PUT','PATCH'].includes(req.method) ? await jsonBody(req) : {};
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
-    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' ORDER BY c.id`).all();
+    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' ORDER BY c.id`).all();
     const operations=db.prepare(`SELECT * FROM operations ORDER BY id DESC LIMIT 100`).all();
     const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
     return send(res,200,{campaigns,operations,settings:{...s,live_deposits:process.env.WB_LIVE_DEPOSITS==='true'}});
@@ -63,7 +68,7 @@ async function api(req,res,url) {
   const ruleMatch=url.pathname.match(/^\/api\/campaigns\/(\d+)\/rule$/);
   if (req.method==='PUT' && ruleMatch) {
     const id=Number(ruleMatch[1]);
-    db.prepare(`INSERT INTO rules(campaign_id,enabled,use_max_drr,max_drr,use_min_ctr,min_ctr,use_time_window,time_from,time_to,min_budget,deposit_amount,daily_limit,funding_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id) DO UPDATE SET enabled=excluded.enabled,use_max_drr=excluded.use_max_drr,max_drr=excluded.max_drr,use_min_ctr=excluded.use_min_ctr,min_ctr=excluded.min_ctr,use_time_window=excluded.use_time_window,time_from=excluded.time_from,time_to=excluded.time_to,min_budget=excluded.min_budget,deposit_amount=excluded.deposit_amount,daily_limit=excluded.daily_limit,funding_type=excluded.funding_type,updated_at=excluded.updated_at`).run(id,body.enabled?1:0,body.use_max_drr!==false?1:0,positive(body.max_drr),body.use_min_ctr!==false?1:0,positive(body.min_ctr),body.use_time_window?1:0,validTime(body.time_from,'00:00'),validTime(body.time_to,'23:59'),positive(body.min_budget),Math.round(positive(body.deposit_amount)),clamp(body.daily_limit,1,100),[0,1,3].includes(Number(body.funding_type))?Number(body.funding_type):1,now());
+    db.prepare(`INSERT INTO rules(campaign_id,enabled,use_max_drr,max_drr,use_min_ctr,min_ctr,use_min_views,min_views,use_min_orders,min_orders,use_time_window,time_from,time_to,min_budget,deposit_amount,daily_limit,funding_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id) DO UPDATE SET enabled=excluded.enabled,use_max_drr=excluded.use_max_drr,max_drr=excluded.max_drr,use_min_ctr=excluded.use_min_ctr,min_ctr=excluded.min_ctr,use_min_views=excluded.use_min_views,min_views=excluded.min_views,use_min_orders=excluded.use_min_orders,min_orders=excluded.min_orders,use_time_window=excluded.use_time_window,time_from=excluded.time_from,time_to=excluded.time_to,min_budget=excluded.min_budget,deposit_amount=excluded.deposit_amount,daily_limit=excluded.daily_limit,funding_type=excluded.funding_type,updated_at=excluded.updated_at`).run(id,body.enabled?1:0,body.use_max_drr!==false?1:0,positive(body.max_drr),body.use_min_ctr!==false?1:0,positive(body.min_ctr),body.use_min_views?1:0,Math.round(positive(body.min_views)),body.use_min_orders?1:0,Math.round(positive(body.min_orders)),body.use_time_window?1:0,validTime(body.time_from,'00:00'),validTime(body.time_to,'23:59'),positive(body.min_budget),Math.round(positive(body.deposit_amount)),clamp(body.daily_limit,1,100),[0,1,3].includes(Number(body.funding_type))?Number(body.funding_type):1,now());
     return send(res,200,{ok:true});
   }
   if (req.method==='POST' && url.pathname==='/api/sync') { await syncCampaigns(); return send(res,200,{ok:true}); }
@@ -84,9 +89,11 @@ async function evaluate(c) {
   if (c.status!=='active') reason='Кампания не активна';
   else if (c.use_time_window && !isMoscowTimeAllowed(c.time_from,c.time_to)) reason=`Вне времени пополнения (${c.time_from}–${c.time_to} МСК)`;
   else if (before>=c.min_budget) reason='Остаток не ниже порога';
-  else if ((c.use_max_drr || c.use_min_ctr) && !c.metrics_available) reason='Статистика CTR/ДРР не получена — пополнение заблокировано';
+  else if ((c.use_max_drr || c.use_min_ctr || c.use_min_views || c.use_min_orders) && !c.metrics_available) reason='Статистика кампании не получена — пополнение заблокировано';
   else if (c.use_max_drr && metrics.drr>c.max_drr) reason='ДРР выше максимума';
   else if (c.use_min_ctr && metrics.ctr<c.min_ctr) reason='CTR ниже минимума';
+  else if (c.use_min_views && Number(c.views)<Number(c.min_views)) reason='Показы ниже минимума';
+  else if (c.use_min_orders && Number(c.orders)<Number(c.min_orders)) reason='Заказы ниже минимума';
   // Wildberries rules use a Moscow calendar day, independent of the server timezone.
   const today=db.prepare(`SELECT count(*) n FROM operations WHERE campaign_id=? AND status='deposited' AND date(created_at,'+3 hours')=date('now','+3 hours')`).get(c.campaign_id).n;
   if (!reason && today>=c.daily_limit) reason='Достигнут дневной лимит';
@@ -110,7 +117,13 @@ async function evaluate(c) {
   finally { db.prepare('DELETE FROM locks WHERE campaign_id=?').run(c.campaign_id); }
 }
 
+let activeSync=null;
 async function syncCampaigns() {
+  if(activeSync) return activeSync;
+  activeSync=doSyncCampaigns();
+  try { return await activeSync; } finally { activeSync=null; }
+}
+async function doSyncCampaigns() {
   const s=db.prepare('SELECT * FROM settings WHERE id=1').get();
   if (s.demo_mode) { seedDemo(); return; }
   if (!s.token_enc) throw new Error('Сначала сохраните токен WB');
@@ -155,11 +168,11 @@ async function syncStatistics(token, ids, days) {
     const stats=await wb(`/adv/v3/fullstats?ids=${batch.join(',')}&beginDate=${beginDate}&endDate=${endDate}`,token);
     for (const item of Array.isArray(stats)?stats:[]) {
       const id=Number(item.advertId || item.advert_id || item.id); if (!id) continue;
-      const spend=Number(item.sum||0),revenue=Number(item.sum_price||0),views=Math.round(Number(item.views||0));
+      const spend=Number(item.sum||0),revenue=Number(item.sum_price||0),views=Math.round(Number(item.views||0)),orders=Math.round(Number(item.orders||0));
       const ctr=Number.isFinite(Number(item.ctr))?Number(item.ctr):(views?Number(item.clicks||0)/views*100:0);
       // Spend without attributed orders must never look like an excellent 0% DRR.
       const drr=revenue>0?spend/revenue*100:(spend>0?999999:0);
-      db.prepare(`UPDATE campaigns SET ctr=?,drr=?,spend=?,revenue=?,views=?,metrics_available=1,metrics_from=?,metrics_to=?,updated_at=? WHERE id=?`).run(ctr,drr,spend,revenue,views,beginDate,endDate,now(),id);
+      db.prepare(`UPDATE campaigns SET ctr=?,drr=?,spend=?,revenue=?,views=?,orders=?,metrics_available=1,metrics_from=?,metrics_to=?,updated_at=? WHERE id=?`).run(ctr,drr,spend,revenue,views,orders,beginDate,endDate,now(),id);
     }
   }
 }
@@ -193,6 +206,17 @@ function now(){return new Date().toISOString()} function positive(v){v=Number(v)
 function send(res,status,data){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data))} async function jsonBody(req){let s='';for await(const c of req){s+=c;if(s.length>1e6)throw new Error('Слишком большой запрос')}return s?JSON.parse(s):{}}
 
 server.listen(PORT,HOST,()=>console.log(`WB AutoFund: http://${HOST}:${PORT}`));
-let running=false,lastAutomaticRun=0;setInterval(async()=>{const minutes=db.prepare('SELECT check_minutes FROM settings WHERE id=1').get().check_minutes;if(running||Date.now()-lastAutomaticRun<minutes*60000)return;running=true;lastAutomaticRun=Date.now();try{await evaluateAll()}catch(e){console.error(e)}finally{running=false}},15000);
+let running=false,lastAutomaticRun=0;setInterval(async()=>{
+  const settings=db.prepare('SELECT * FROM settings WHERE id=1').get(),minutes=settings.check_minutes;
+  if(running||Date.now()-lastAutomaticRun<minutes*60000)return;
+  running=true;lastAutomaticRun=Date.now();
+  try {
+    // A closed browser must not stop automation: refresh WB data on the server
+    // before every decision. If sync fails, evaluation is skipped safely.
+    if(!settings.demo_mode) await syncCampaigns();
+    await evaluateAll();
+  } catch(e) { console.error('Automatic cycle skipped:',e); }
+  finally { running=false; }
+},15000);
 function shutdown(){server.close(()=>{db.close();process.exit(0)});setTimeout(()=>process.exit(1),10000).unref()}
 process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);
