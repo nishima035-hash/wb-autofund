@@ -1,0 +1,5 @@
+.wba-search{position:sticky;top:-13px;z-index:2;background:#f7f6f9;padding:13px 0 10px}
+.wba-search input{width:100%;border:1px solid #d9d4df;border-radius:10px;background:#fff;padding:11px 12px;font:13px Arial;outline:none}
+.wba-search input:focus{border-color:#8530ed;box-shadow:0 0 0 3px #8530ed18}
+.wba-search small{display:block;margin:5px 2px 0;color:#888}
+.wba-empty{padding:30px 10px;text-align:center;color:#888}
