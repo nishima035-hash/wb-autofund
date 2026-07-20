@@ -25,6 +25,11 @@ migrateColumn('rules','use_min_ctr','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('rules','use_time_window','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','time_from','TEXT NOT NULL DEFAULT \'00:00\'');
 migrateColumn('rules','time_to','TEXT NOT NULL DEFAULT \'23:59\'');
+migrateColumn('settings','stats_days','INTEGER NOT NULL DEFAULT 7');
+migrateColumn('campaigns','views','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('campaigns','metrics_available','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('campaigns','metrics_from','TEXT');
+migrateColumn('campaigns','metrics_to','TEXT');
 seedDemo();
 
 const mime = {'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml'};
@@ -46,13 +51,13 @@ async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
     const campaigns=db.prepare(`SELECT c.*,r.enabled,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id ORDER BY c.id`).all();
     const operations=db.prepare(`SELECT * FROM operations ORDER BY id DESC LIMIT 100`).all();
-    const s=db.prepare(`SELECT demo_mode,check_minutes,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
+    const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
     return send(res,200,{campaigns,operations,settings:{...s,live_deposits:process.env.WB_LIVE_DEPOSITS==='true'}});
   }
   if (req.method==='POST' && url.pathname==='/api/settings') {
     const current=db.prepare('SELECT * FROM settings WHERE id=1').get();
     const token=typeof body.token==='string'&&body.token.trim()?encrypt(body.token.trim()):current.token_enc;
-    db.prepare('UPDATE settings SET token_enc=?,demo_mode=?,check_minutes=?,updated_at=? WHERE id=1').run(token,body.demo_mode?1:0,clamp(body.check_minutes,1,60),now());
+    db.prepare('UPDATE settings SET token_enc=?,demo_mode=?,check_minutes=?,stats_days=?,updated_at=? WHERE id=1').run(token,body.demo_mode?1:0,clamp(body.check_minutes,1,60),clamp(body.stats_days ?? current.stats_days ?? 7,1,31),now());
     return send(res,200,{ok:true});
   }
   const ruleMatch=url.pathname.match(/^\/api\/campaigns\/(\d+)\/rule$/);
@@ -79,6 +84,7 @@ async function evaluate(c) {
   if (c.status!=='active') reason='Кампания не активна';
   else if (c.use_time_window && !isMoscowTimeAllowed(c.time_from,c.time_to)) reason=`Вне времени пополнения (${c.time_from}–${c.time_to} МСК)`;
   else if (before>=c.min_budget) reason='Остаток не ниже порога';
+  else if ((c.use_max_drr || c.use_min_ctr) && !c.metrics_available) reason='Статистика CTR/ДРР не получена — пополнение заблокировано';
   else if (c.use_max_drr && metrics.drr>c.max_drr) reason='ДРР выше максимума';
   else if (c.use_min_ctr && metrics.ctr<c.min_ctr) reason='CTR ниже минимума';
   // Wildberries rules use a Moscow calendar day, independent of the server timezone.
@@ -127,6 +133,26 @@ async function syncCampaigns() {
     db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at) VALUES(?,?,?,?,0,0,'wb',?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,budget=excluded.budget,source='wb',updated_at=excluded.updated_at`).run(id,name,Number(a.status)===9?'active':'paused',Number(budget.total||0),now());
     await new Promise(resolve=>setTimeout(resolve,275));
   }
+  await syncStatistics(token, campaigns.map(a=>Number(a.advertId || a.advert_id || a.id)).filter(Boolean), s.stats_days || 7);
+}
+
+async function syncStatistics(token, ids, days) {
+  const end=new Date(),begin=new Date(end); begin.setUTCDate(begin.getUTCDate()-Math.max(0,Number(days)-1));
+  const beginDate=ymdMoscow(begin),endDate=ymdMoscow(end);
+  db.prepare(`UPDATE campaigns SET metrics_available=0 WHERE source='wb'`).run();
+  for (let offset=0;offset<ids.length;offset+=50) {
+    const batch=ids.slice(offset,offset+50);
+    if (offset) await new Promise(resolve=>setTimeout(resolve,20500));
+    const stats=await wb(`/adv/v3/fullstats?ids=${batch.join(',')}&beginDate=${beginDate}&endDate=${endDate}`,token);
+    for (const item of Array.isArray(stats)?stats:[]) {
+      const id=Number(item.advertId || item.advert_id || item.id); if (!id) continue;
+      const spend=Number(item.sum||0),revenue=Number(item.sum_price||0),views=Math.round(Number(item.views||0));
+      const ctr=Number.isFinite(Number(item.ctr))?Number(item.ctr):(views?Number(item.clicks||0)/views*100:0);
+      // Spend without attributed orders must never look like an excellent 0% DRR.
+      const drr=revenue>0?spend/revenue*100:(spend>0?999999:0);
+      db.prepare(`UPDATE campaigns SET ctr=?,drr=?,spend=?,revenue=?,views=?,metrics_available=1,metrics_from=?,metrics_to=?,updated_at=? WHERE id=?`).run(ctr,drr,spend,revenue,views,beginDate,endDate,now(),id);
+    }
+  }
 }
 
 async function wb(path,token,body) {
@@ -137,6 +163,7 @@ function log(c,status,reason,amount,before,after,idem=null){db.prepare(`INSERT O
 function seedDemo(){if(db.prepare('SELECT count(*) n FROM campaigns').get().n)return;const q=db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,spend,revenue,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`);[[9134001,'Кроссовки — Поиск','active',320,7.4,8.1,8100,100000],[9134002,'Рюкзаки — Каталог','active',870,3.8,14.6,7300,50000],[9134003,'Футболки — Авто','active',190,6.2,10.9,5450,50000]].forEach(x=>q.run(...x,'demo',now()));}
 function migrateColumn(table,column,definition){const columns=db.prepare(`PRAGMA table_info(${table})`).all();if(!columns.some(x=>x.name===column))db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);}
 function validTime(value,fallback){return typeof value==='string'&&/^([01]\d|2[0-3]):[0-5]\d$/.test(value)?value:fallback;}
+function ymdMoscow(date){return new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit',day:'2-digit'}).format(date);}
 function isMoscowTimeAllowed(from,to,date=new Date()){const parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(date);const current=Number(parts.find(x=>x.type==='hour').value)*60+Number(parts.find(x=>x.type==='minute').value);const minutes=s=>Number(s.slice(0,2))*60+Number(s.slice(3));const start=minutes(from),end=minutes(to);return start<=end?current>=start&&current<=end:current>=start||current<=end;}
 function key(){const raw=process.env.APP_ENCRYPTION_KEY;if(!raw||!/^[a-f0-9]{64}$/i.test(raw))return createHash('sha256').update(`local-dev:${process.cwd()}`).digest();return Buffer.from(raw,'hex');}
 function encrypt(s){const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',key(),iv),data=Buffer.concat([c.update(s,'utf8'),c.final()]);return [iv,c.getAuthTag(),data].map(x=>x.toString('base64url')).join('.');}
