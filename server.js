@@ -72,6 +72,7 @@ async function api(req,res,url) {
   }
   if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataV2(url.searchParams.get('campaign_id'),url.searchParams.get('week')));
   if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsDataV2(url.searchParams.get('from'),url.searchParams.get('to'),url.searchParams.get('campaign_id')));
+  if (req.method==='GET' && url.pathname==='/api/shared/export') return send(res,200,sharedExport(url.searchParams.get('from'),url.searchParams.get('to')));
   if (req.method==='POST' && url.pathname==='/api/settings') {
     const current=db.prepare('SELECT * FROM settings WHERE id=1').get();
     const token=typeof body.token==='string'&&body.token.trim()?encrypt(body.token.trim()):current.token_enc;
@@ -159,6 +160,7 @@ async function doSyncCampaigns() {
     const name=a.name || a.settings?.name || `Кампания ${id}`;
     db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at) VALUES(?,?,?,0,0,0,'wb',?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,source='wb',updated_at=excluded.updated_at`).run(id,name,Number(a.status)===9?'active':'paused',now());
   }
+  await syncCampaignBids(token,campaigns);
   // Statistics has the strictest WB limit, so request it before the per-campaign
   // budget calls consume the seller's shared promotion API allowance.
   await new Promise(resolve=>setTimeout(resolve,21000));
@@ -169,6 +171,15 @@ async function doSyncCampaigns() {
     db.prepare(`UPDATE campaigns SET budget=?,updated_at=? WHERE id=?`).run(Number(budget.total||0),now(),id);
     await new Promise(resolve=>setTimeout(resolve,300));
   }
+}
+
+async function syncCampaignBids(token,campaigns){
+  const ids=campaigns.map(a=>Number(a.advertId||a.advert_id||a.id)).filter(Boolean),stamp=moscowTimestamp();let changed=0,seen=0;
+  for(let offset=0;offset<ids.length;offset+=50){if(offset)await new Promise(resolve=>setTimeout(resolve,1100));const response=await wb(`/api/advert/v2/adverts?ids=${ids.slice(offset,offset+50).join(',')}`,token),items=Array.isArray(response)?response:(response?.adverts||response?.data||[]);
+    for(const item of items){const id=Number(item.advertId||item.advert_id||item.id);if(!id)continue;const settings=item.settings&&typeof item.settings==='object'?item.settings:{},name=item.name||item.campaignName||item.advertName||settings.name||`Кампания ${id}`,payment=String(item.paymentType||item.payment_type||settings.payment_type||settings.paymentType||'').toUpperCase(),nms=Array.isArray(item.nm_settings)?item.nm_settings:(Array.isArray(settings.nm_settings)?settings.nm_settings:[]);
+      for(const nm of nms){const nmId=String(nm.nm_id||nm.nmId||nm.nm||'');if(!nmId)continue;const bids=nm.bids_kopecks&&typeof nm.bids_kopecks==='object'?nm.bids_kopecks:{},subject=typeof nm.subject==='object'?(nm.subject.name||nm.subject.id||''):(nm.subject||nm.subject_name||nm.name||'');for(const placement of ['search','recommendations']){const kopecks=Number(bids[placement]);if(!Number.isFinite(kopecks))continue;const rub=kopecks/100,old=db.prepare(`SELECT bid_rub FROM campaign_bids WHERE campaign_id=? AND nm_id=? AND placement=?`).get(id,nmId,placement);if(old&&Number(old.bid_rub)!==rub){db.prepare(`INSERT OR IGNORE INTO campaign_bid_changes(changed_at,campaign_id,nm_id,placement,old_value,new_value) VALUES(?,?,?,?,?,?)`).run(stamp,id,nmId,placement,String(old.bid_rub),String(rub));changed++}db.prepare(`INSERT INTO campaign_bids(campaign_id,campaign_name,nm_id,subject,placement,bid_rub,payment_type,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id,nm_id,placement) DO UPDATE SET campaign_name=excluded.campaign_name,subject=excluded.subject,bid_rub=excluded.bid_rub,payment_type=excluded.payment_type,updated_at=excluded.updated_at`).run(id,name,nmId,String(subject),placement,rub,payment,stamp);db.prepare(`INSERT OR IGNORE INTO campaign_bid_history(snapshot_at,campaign_id,campaign_name,nm_id,subject,placement,bid_rub,payment_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`).run(stamp,id,name,nmId,String(subject),placement,rub,payment,stamp);seen++}}}
+  }
+  console.log(`WB bids synced: ${seen}; changed: ${changed}`);return{seen,changed};
 }
 
 async function syncStatistics(token, ids, days) {
@@ -246,6 +257,7 @@ function analyticsDataV2(from,to,campaignId){
   const products=db.prepare(`SELECT b.*,ch.old_value,ch.new_value,ch.changed_at,(SELECT COUNT(*) FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ?) changes FROM campaign_bids b LEFT JOIN campaign_bid_changes ch ON ch.rowid=(SELECT x.rowid FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ? ORDER BY x.changed_at DESC LIMIT 1) WHERE b.campaign_id=? ORDER BY b.nm_id,b.placement`).all(`${start} 00:00:00`,`${end} 23:59:59`,`${start} 00:00:00`,`${end} 23:59:59`,selected);
   return{from:start,to:end,selected_id:selected,rows,products};
 }
+function sharedExport(from,to){const end=to&&/^\d{4}-\d{2}-\d{2}$/.test(to)?to:ymdMoscow(new Date()),start=from&&/^\d{4}-\d{2}-\d{2}$/.test(from)?from:(()=>{const d=new Date();d.setUTCDate(d.getUTCDate()-6);return ymdMoscow(d)})();return{generated_at:now(),from:start,to:end,campaigns:db.prepare(`SELECT * FROM campaigns WHERE status<>'archived' ORDER BY id`).all(),daily_stats:db.prepare(`SELECT * FROM campaign_daily_stats WHERE stat_date BETWEEN ? AND ? ORDER BY stat_date,campaign_id`).all(start,end),bids:db.prepare(`SELECT * FROM campaign_bids ORDER BY campaign_id,nm_id,placement`).all(),bid_changes:db.prepare(`SELECT * FROM campaign_bid_changes WHERE changed_at BETWEEN ? AND ? ORDER BY changed_at`).all(`${start} 00:00:00`,`${end} 23:59:59`),hourly:db.prepare(`SELECT * FROM hourly_snapshots WHERE snapshot_at BETWEEN ? AND ? ORDER BY snapshot_at`).all(`${start} 00:00:00`,`${end} 23:59:59`)}}
 function mondayOf(value){const d=new Date(`${String(value).slice(0,10)}T00:00:00Z`);if(Number.isNaN(d.getTime()))return weekMonday();d.setUTCDate(d.getUTCDate()-((d.getUTCDay()+6)%7));return d.toISOString().slice(0,10)}
 function weekLabel(value){const a=new Date(`${value}T00:00:00Z`),b=new Date(a);b.setUTCDate(b.getUTCDate()+6);const f=d=>new Intl.DateTimeFormat('ru-RU',{timeZone:'UTC',day:'2-digit',month:'2-digit',year:'numeric'}).format(d);return `${f(a)} — ${f(b)}`}
 function migrateColumn(table,column,definition){const columns=db.prepare(`PRAGMA table_info(${table})`).all();if(!columns.some(x=>x.name===column))db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);}
