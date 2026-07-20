@@ -130,13 +130,19 @@ async function syncCampaigns() {
   db.prepare(`UPDATE campaigns SET status='archived' WHERE source='wb'`).run();
   for (const a of campaigns) {
     const id=Number(a.advertId || a.advert_id || a.id); if (!id) continue;
-    const budget=await wb(`/adv/v1/budget?id=${id}`,token);
     const name=a.name || a.settings?.name || `Кампания ${id}`;
-    db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at) VALUES(?,?,?,?,0,0,'wb',?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,budget=excluded.budget,source='wb',updated_at=excluded.updated_at`).run(id,name,Number(a.status)===9?'active':'paused',Number(budget.total||0),now());
-    await new Promise(resolve=>setTimeout(resolve,275));
+    db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at) VALUES(?,?,?,0,0,0,'wb',?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,source='wb',updated_at=excluded.updated_at`).run(id,name,Number(a.status)===9?'active':'paused',now());
   }
-  await new Promise(resolve=>setTimeout(resolve,1100));
+  // Statistics has the strictest WB limit, so request it before the per-campaign
+  // budget calls consume the seller's shared promotion API allowance.
+  await new Promise(resolve=>setTimeout(resolve,21000));
   await syncStatistics(token, campaigns.map(a=>Number(a.advertId || a.advert_id || a.id)).filter(Boolean), s.stats_days || 7);
+  for (const a of campaigns) {
+    const id=Number(a.advertId || a.advert_id || a.id); if (!id) continue;
+    const budget=await wb(`/adv/v1/budget?id=${id}`,token);
+    db.prepare(`UPDATE campaigns SET budget=?,updated_at=? WHERE id=?`).run(Number(budget.total||0),now(),id);
+    await new Promise(resolve=>setTimeout(resolve,300));
+  }
 }
 
 async function syncStatistics(token, ids, days) {
@@ -160,13 +166,13 @@ async function syncStatistics(token, ids, days) {
 
 async function wb(path,token,body) {
   const options={method:body?'POST':'GET',headers:{Authorization:token,...(body?{'content-type':'application/json'}:{})},body:body?JSON.stringify(body):undefined};
-  for (let attempt=0;attempt<4;attempt++) {
+  for (let attempt=0;attempt<6;attempt++) {
     const r=await fetch(`${process.env.WB_API_BASE||'https://advert-api.wildberries.ru'}${path}`,options);
     if (r.ok) { const text=await r.text(); return text?JSON.parse(text):{}; }
     const errorText=await r.text();
     // Only retry read operations. Retrying a deposit could charge a campaign twice.
-    if (r.status!==429 || body || attempt===3) throw new Error(`WB API: ${r.status} ${errorText}`);
-    const retryAfter=Number(r.headers.get('retry-after'));
+    if (r.status!==429 || body || attempt===5) throw new Error(`WB API: ${r.status} ${errorText}`);
+    const retryAfter=Number(r.headers.get('x-ratelimit-retry') || r.headers.get('retry-after'));
     const baseDelay=path.startsWith('/adv/v3/fullstats')?21000:1100;
     await new Promise(resolve=>setTimeout(resolve,Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:baseDelay*(attempt+1)));
   }
