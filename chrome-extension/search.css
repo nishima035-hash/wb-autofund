@@ -1,6 +1,11 @@
-.wba-search{position:sticky;top:-13px;z-index:2;background:#f7f6f9;padding:13px 0 10px}
+.wba-search{position:relative;z-index:2;background:#f7f6f9;padding:13px 0 10px}
 .wba-search input{width:100%;border:1px solid #d9d4df;border-radius:10px;background:#fff;padding:11px 12px;font:13px Arial;outline:none}
 .wba-search select{width:100%;margin-top:7px;border:1px solid #d9d4df;border-radius:10px;background:#fff;padding:10px 12px;font:13px Arial}
 .wba-search input:focus{border-color:#8530ed;box-shadow:0 0 0 3px #8530ed18}
 .wba-search small{display:block;margin:5px 2px 0;color:#888}
 .wba-empty{padding:30px 10px;text-align:center;color:#888}
+.wba-tabs{position:sticky;top:-13px;z-index:3;display:grid;grid-template-columns:1fr 1fr;gap:5px;background:#f7f6f9;padding:10px 0}
+.wba-tabs button{border:0;border-radius:8px;padding:9px;background:#ebe8ef;color:#645d6b;font-weight:700;cursor:pointer}
+.wba-tabs button.active{background:#8530ed;color:#fff}
+.wba-log{background:#fff;border:1px solid #e7e4eb;border-radius:11px;padding:12px;margin-bottom:8px}
+.wba-log div{display:flex;flex-direction:column;gap:2px}.wba-log small{color:#888}.wba-log strong{display:block;margin-top:8px;color:#6d25cf}.wba-log strong.deposited{color:#16844d}.wba-log strong.paused{color:#b66a12}.wba-log p{margin:5px 0 0;color:#777;font-size:11px}

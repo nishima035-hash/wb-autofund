@@ -123,9 +123,10 @@ async function api(req,res,url) {
       for(const campaign of campaigns){const metrics=byCampaign.get(Number(campaign.id));if(!metrics){campaign.metrics_available=0;continue}campaign.views=Number(metrics.views||0);campaign.orders=Number(metrics.orders||0);campaign.spend=Number(metrics.spend||0);campaign.revenue=Number(metrics.revenue||0);campaign.ctr=metrics.views?Number(metrics.clicks||0)*100/Number(metrics.views):0;campaign.drr=metrics.revenue?campaign.spend*100/campaign.revenue:(campaign.spend>0?999999:0);campaign.metrics_available=1;campaign.metrics_from=periodFrom;campaign.metrics_to=periodTo;}
     }
     const operations=db.prepare(`SELECT * FROM operations WHERE legal_entity_id=? ORDER BY id DESC LIMIT 100`).all(entityId);
+    const activityOperations=db.prepare(`SELECT * FROM operations WHERE legal_entity_id=? AND status IN ('deposited','resumed','paused') ORDER BY id DESC LIMIT 100`).all(entityId);
     const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,auto_sync_enabled,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
     const entities=listLegalEntities(),entity=entities.find(x=>x.id===entityId);
-    return send(res,200,{campaigns,operations,entities,active_entity_id:entityId,settings:{...s,token_saved:entity?.token_saved||0,display_from:periodFrom||null,display_to:periodTo||null,live_deposits:process.env.WB_LIVE_DEPOSITS==='true',live_resume:process.env.WB_LIVE_RESUME==='true'}});
+    return send(res,200,{campaigns,operations,activity_operations:activityOperations,entities,active_entity_id:entityId,settings:{...s,token_saved:entity?.token_saved||0,display_from:periodFrom||null,display_to:periodTo||null,live_deposits:process.env.WB_LIVE_DEPOSITS==='true',live_resume:process.env.WB_LIVE_RESUME==='true'}});
   }
   if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataV2(url.searchParams.get('campaign_id'),url.searchParams.get('week'),activeEntityId(url)));
   if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsDataV2(url.searchParams.get('from'),url.searchParams.get('to'),url.searchParams.get('campaign_id'),activeEntityId(url)));
