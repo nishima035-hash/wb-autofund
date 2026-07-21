@@ -245,7 +245,13 @@ function hourlyDataV2(campaignId,week){
   const available=db.prepare(`SELECT DISTINCT substr(h.snapshot_at,1,10) day FROM hourly_snapshots h JOIN campaigns c ON c.id=h.campaign_id WHERE c.status<>'archived' ORDER BY day DESC`).all().map(x=>mondayOf(x.day));
   const weeks=[...new Set([weekMonday(),...available])].sort().reverse().map(value=>({value,label:weekLabel(value)}));
   const start=/^\d{4}-\d{2}-\d{2}$/.test(week||'')?mondayOf(week):weeks[0]?.value||weekMonday(),end=new Date(`${start}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+7);
-  const rows=db.prepare(`SELECT * FROM hourly_snapshots WHERE campaign_id=? AND snapshot_at>=? AND snapshot_at<? ORDER BY snapshot_at`).all(id,`${start} 00:00:00`,`${end.toISOString().slice(0,10)} 00:00:00`),cells=[];let previous=null,previousDay='';
+  const rows=db.prepare(`SELECT * FROM hourly_snapshots WHERE campaign_id=? AND snapshot_at>=? AND snapshot_at<? ORDER BY snapshot_at`).all(id,`${start} 00:00:00`,`${end.toISOString().slice(0,10)} 00:00:00`),cells=[];
+  // Several syncs can happen within one hour. Keep the latest cumulative
+  // snapshot for each hour, so the resulting delta represents the whole hour.
+  const latestByHour=new Map();
+  for(const row of rows) latestByHour.set(row.snapshot_at.slice(0,13),row);
+  rows.splice(0,rows.length,...latestByHour.values());
+  let previous=null,previousDay='';
   for(const r of rows){const day=r.snapshot_at.slice(0,10),hour=Number(r.snapshot_at.slice(11,13));let views=null,clicks=null,uncertain=r.quality!=='ok',note=r.note||'';if(previous&&previousDay===day&&r.impressions_total!=null&&previous.impressions_total!=null){views=Math.max(0,r.impressions_total-previous.impressions_total);clicks=Math.max(0,r.clicks_total-previous.clicks_total)}else if(r.impressions_total!=null){views=r.impressions_total;clicks=r.clicks_total;uncertain=true;note=note||'Первый снимок дня'}cells.push({date:day,hour,views,clicks,uncertain,note});previous=r;previousDay=day}
   return{campaigns,weeks,selected_id:id,week:start,cells};
 }
