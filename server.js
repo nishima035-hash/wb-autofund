@@ -182,6 +182,21 @@ async function syncCampaignBids(token,campaigns){
   console.log(`WB bids synced: ${seen}; changed: ${changed}`);return{seen,changed};
 }
 
+function emptyStatMetrics(){return{views:0,clicks:0,orders:0,spend:0,revenue:0}}
+function sumStatMetrics(total,value){
+  total.views+=value.views;total.clicks+=value.clicks;total.orders+=value.orders;
+  total.spend+=value.spend;total.revenue+=value.revenue;return total;
+}
+function wbStatMetrics(source){
+  const direct={views:Math.round(Number(source?.views||0)),clicks:Math.round(Number(source?.clicks||0)),orders:Math.round(Number(source?.orders||0)),spend:Number(source?.sum||0),revenue:Number(source?.sum_price||source?.sumPrice||0)};
+  const apps=Array.isArray(source?.apps)?source.apps:[];
+  if(!apps.length)return direct;
+  const nested=apps.map(app=>({views:Math.round(Number(app?.views||0)),clicks:Math.round(Number(app?.clicks||0)),orders:Math.round(Number(app?.orders||0)),spend:Number(app?.sum||0),revenue:Number(app?.sum_price||app?.sumPrice||0)})).reduce(sumStatMetrics,emptyStatMetrics());
+  // Prefer an explicit aggregate, but recover individual zero fields from the
+  // platform rows when WB omitted them at the parent level.
+  return Object.fromEntries(Object.keys(direct).map(key=>[key,direct[key]||nested[key]||0]));
+}
+
 async function syncStatistics(token, ids, days) {
   const end=new Date(),begin=new Date(end); begin.setUTCDate(begin.getUTCDate()-Math.max(0,Number(days)-1));
   const beginDate=ymdMoscow(begin),endDate=ymdMoscow(end);
@@ -193,20 +208,24 @@ async function syncStatistics(token, ids, days) {
     const statItems=Array.isArray(stats)?stats:(Array.isArray(stats?.data)?stats.data:(Array.isArray(stats?.adverts)?stats.adverts:[]));
     for (const item of statItems) {
       const id=Number(item.advertId || item.advert_id || item.id); if (!id) continue;
-      const spend=Number(item.sum||0),revenue=Number(item.sum_price||0),views=Math.round(Number(item.views||0)),orders=Math.round(Number(item.orders||0));
-      const ctr=Number.isFinite(Number(item.ctr))?Number(item.ctr):(views?Number(item.clicks||0)/views*100:0);
+      const days=Array.isArray(item.days)?item.days:[];
+      // WB can return stale/zero totals at campaign level while the actual
+      // values are present in days/apps. Build campaign totals from the daily
+      // rows, which also makes the selected statistics period unambiguous.
+      const period=days.length?days.map(wbStatMetrics).reduce(sumStatMetrics,emptyStatMetrics()):wbStatMetrics(item);
+      const spend=period.spend,revenue=period.revenue,views=period.views,orders=period.orders;
+      const ctr=views?period.clicks/views*100:0;
       // Spend without attributed orders must never look like an excellent 0% DRR.
       const drr=revenue>0?spend/revenue*100:(spend>0?999999:0);
       db.prepare(`UPDATE campaigns SET ctr=?,drr=?,spend=?,revenue=?,views=?,orders=?,metrics_available=1,metrics_from=?,metrics_to=?,updated_at=? WHERE id=?`).run(ctr,drr,spend,revenue,views,orders,beginDate,endDate,now(),id);
-      const days=Array.isArray(item.days)?item.days:[];
       for(const day of days){
         const statDate=String(day.date||'').slice(0,10);if(!statDate)continue;
-        const daySpend=Number(day.sum||0),dayRevenue=Number(day.sum_price||0),dayViews=Math.round(Number(day.views||0)),dayClicks=Math.round(Number(day.clicks||0)),dayOrders=Math.round(Number(day.orders||0));
+        const dayMetrics=wbStatMetrics(day),daySpend=dayMetrics.spend,dayRevenue=dayMetrics.revenue,dayViews=dayMetrics.views,dayClicks=dayMetrics.clicks,dayOrders=dayMetrics.orders;
         const dayCtr=Number.isFinite(Number(day.ctr))?Number(day.ctr):(dayViews?dayClicks/dayViews*100:0),dayDrr=dayRevenue?daySpend/dayRevenue*100:(daySpend?999999:0);
         db.prepare(`INSERT INTO campaign_daily_stats(campaign_id,stat_date,views,clicks,orders,spend,revenue,ctr,drr,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id,stat_date) DO UPDATE SET views=excluded.views,clicks=excluded.clicks,orders=excluded.orders,spend=excluded.spend,revenue=excluded.revenue,ctr=excluded.ctr,drr=excluded.drr,updated_at=excluded.updated_at`).run(id,statDate,dayViews,dayClicks,dayOrders,daySpend,dayRevenue,dayCtr,dayDrr,now());
       }
       const today=days.find(day=>String(day.date||'').slice(0,10)===endDate);
-      if(today){const campaign=db.prepare('SELECT name,status FROM campaigns WHERE id=?').get(id)||{};db.prepare(`INSERT OR IGNORE INTO hourly_snapshots(campaign_id,campaign_name,status,snapshot_at,impressions_total,clicks_total,quality,note) VALUES(?,?,?,?,?,?,'ok','WB API')`).run(id,campaign.name||'',campaign.status||'',moscowTimestamp(),Math.round(Number(today.views||0)),Math.round(Number(today.clicks||0)));}
+      if(today){const campaign=db.prepare('SELECT name,status FROM campaigns WHERE id=?').get(id)||{},todayMetrics=wbStatMetrics(today);db.prepare(`INSERT OR IGNORE INTO hourly_snapshots(campaign_id,campaign_name,status,snapshot_at,impressions_total,clicks_total,quality,note) VALUES(?,?,?,?,?,?,'ok','WB API')`).run(id,campaign.name||'',campaign.status||'',moscowTimestamp(),todayMetrics.views,todayMetrics.clicks);}
     }
   }
 }
