@@ -138,10 +138,10 @@ async function evaluate(c) {
   const metrics={ctr:Number(c.ctr),drr:Number(c.drr)};
   if (c.status==='active' && c.auto_pause) {
     const stopConditions=[];
-    if (c.pause_use_max_drr && metrics.drr>=Number(c.pause_max_drr)) stopConditions.push(`ДРР ${metrics.drr.toFixed(2)}% ≥ ${Number(c.pause_max_drr)}%`);
-    if (c.pause_use_min_ctr && metrics.ctr<=Number(c.pause_min_ctr)) stopConditions.push(`CTR ${metrics.ctr.toFixed(2)}% ≤ ${Number(c.pause_min_ctr)}%`);
-    if (c.pause_use_min_views && Number(c.views)<=Number(c.pause_min_views)) stopConditions.push(`Показы ${Number(c.views)} ≤ ${Number(c.pause_min_views)}`);
-    if (c.pause_use_min_orders && Number(c.orders)<=Number(c.pause_min_orders)) stopConditions.push(`Заказы ${Number(c.orders)} ≤ ${Number(c.pause_min_orders)}`);
+    if (c.pause_use_max_drr && metrics.drr>Number(c.pause_max_drr)) stopConditions.push(`ДРР ${metrics.drr.toFixed(2)}% > ${Number(c.pause_max_drr)}%`);
+    if (c.pause_use_min_ctr && metrics.ctr>Number(c.pause_min_ctr)) stopConditions.push(`CTR ${metrics.ctr.toFixed(2)}% > ${Number(c.pause_min_ctr)}%`);
+    if (c.pause_use_min_views && Number(c.views)>Number(c.pause_min_views)) stopConditions.push(`Показы ${Number(c.views)} > ${Number(c.pause_min_views)}`);
+    if (c.pause_use_min_orders && Number(c.orders)>Number(c.pause_min_orders)) stopConditions.push(`Заказы ${Number(c.orders)} > ${Number(c.pause_min_orders)}`);
     if (stopConditions.length && c.metrics_available) return pauseCampaign(c,before,stopConditions.join('; '));
   }
   let reason='';
