@@ -15,6 +15,7 @@ mkdirSync(DATA, { recursive: true });
 const db = new DatabaseSync(join(DATA, 'wb-autofund.sqlite'));
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS settings (id INTEGER PRIMARY KEY CHECK(id=1), token_enc TEXT, demo_mode INTEGER NOT NULL DEFAULT 1, check_minutes INTEGER NOT NULL DEFAULT 5, updated_at TEXT);
+CREATE TABLE IF NOT EXISTS legal_entities (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, token_enc TEXT, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS campaigns (id INTEGER PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', budget REAL NOT NULL, ctr REAL NOT NULL, drr REAL NOT NULL, spend REAL NOT NULL DEFAULT 0, revenue REAL NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'demo', updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS rules (campaign_id INTEGER PRIMARY KEY REFERENCES campaigns(id) ON DELETE CASCADE, enabled INTEGER NOT NULL DEFAULT 0, max_drr REAL NOT NULL, min_ctr REAL NOT NULL, min_budget REAL NOT NULL, deposit_amount INTEGER NOT NULL, daily_limit INTEGER NOT NULL, funding_type INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS operations (id INTEGER PRIMARY KEY AUTOINCREMENT, campaign_id INTEGER NOT NULL, campaign_name TEXT NOT NULL, created_at TEXT NOT NULL, action TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, amount INTEGER NOT NULL DEFAULT 0, budget_before REAL, budget_after REAL, ctr REAL, drr REAL, idempotency_key TEXT UNIQUE);
@@ -33,6 +34,15 @@ migrateColumn('rules','time_from','TEXT NOT NULL DEFAULT \'00:00\'');
 migrateColumn('rules','time_to','TEXT NOT NULL DEFAULT \'23:59\'');
 migrateColumn('settings','stats_days','INTEGER NOT NULL DEFAULT 7');
 migrateColumn('settings','auto_sync_enabled','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('settings','active_entity_id','INTEGER');
+migrateColumn('campaigns','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('operations','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('hourly_snapshots','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('campaign_daily_stats','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('sync_history','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('campaign_bids','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('campaign_bid_history','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('campaign_bid_changes','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('campaigns','views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('campaigns','metrics_available','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('campaigns','metrics_from','TEXT');
@@ -56,6 +66,7 @@ migrateColumn('rules','pause_use_min_views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','pause_min_views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','pause_use_min_orders','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','pause_min_orders','INTEGER NOT NULL DEFAULT 0');
+ensureDefaultLegalEntity();
 seedDemo();
 // A large Diary archive can contain hundreds of thousands of rows. Importing it
 // synchronously before listen() makes Docker health checks fail with a 502.
@@ -78,26 +89,48 @@ const server = http.createServer(async (req,res) => {
 async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{status:'ok',database:'sqlite',time:now()});
   const body = ['POST','PUT','PATCH'].includes(req.method) ? await jsonBody(req) : {};
+  if (req.method==='GET' && url.pathname==='/api/legal-entities') return send(res,200,{entities:listLegalEntities(),active_entity_id:activeEntityId(url)});
+  if (req.method==='POST' && url.pathname==='/api/legal-entities') {
+    const name=String(body.name||'').trim();if(!name)throw new Error('Укажите название юрлица');
+    const token=String(body.token||'').trim();if(!token)throw new Error('Укажите API-токен WB');
+    const result=db.prepare('INSERT INTO legal_entities(name,token_enc,enabled,created_at,updated_at) VALUES(?,?,1,?,?)').run(name,encrypt(token),now(),now());
+    db.prepare('UPDATE settings SET active_entity_id=?,updated_at=? WHERE id=1').run(Number(result.lastInsertRowid),now());
+    return send(res,201,{ok:true,id:Number(result.lastInsertRowid)});
+  }
+  const entityMatch=url.pathname.match(/^\/api\/legal-entities\/(\d+)$/);
+  if (req.method==='PUT' && entityMatch) {
+    const id=Number(entityMatch[1]),current=db.prepare('SELECT * FROM legal_entities WHERE id=?').get(id);if(!current)throw new Error('Юрлицо не найдено');
+    const name=String(body.name??current.name).trim();if(!name)throw new Error('Укажите название юрлица');
+    const token=String(body.token||'').trim()?encrypt(String(body.token).trim()):current.token_enc;
+    db.prepare('UPDATE legal_entities SET name=?,token_enc=?,enabled=?,updated_at=? WHERE id=?').run(name,token,body.enabled===false?0:1,now(),id);return send(res,200,{ok:true});
+  }
+  if (req.method==='POST' && url.pathname==='/api/legal-entities/select') {
+    const id=Number(body.id);if(!db.prepare('SELECT id FROM legal_entities WHERE id=?').get(id))throw new Error('Юрлицо не найдено');
+    db.prepare('UPDATE settings SET active_entity_id=?,updated_at=? WHERE id=1').run(id,now());return send(res,200,{ok:true});
+  }
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
-    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.auto_resume,r.resume_daily_limit,r.resume_delay_seconds,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.metrics_days,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type,r.auto_pause,r.pause_use_max_drr,r.pause_max_drr,r.pause_use_min_ctr,r.pause_min_ctr,r.pause_use_min_views,r.pause_min_views,r.pause_use_min_orders,r.pause_min_orders FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' ORDER BY c.id`).all();
+    const entityId=activeEntityId(url);
+    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.auto_resume,r.resume_daily_limit,r.resume_delay_seconds,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.metrics_days,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type,r.auto_pause,r.pause_use_max_drr,r.pause_max_drr,r.pause_use_min_ctr,r.pause_min_ctr,r.pause_use_min_views,r.pause_min_views,r.pause_use_min_orders,r.pause_min_orders FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' AND c.legal_entity_id=? ORDER BY c.id`).all(entityId);
     let periodFrom=url.searchParams.get('from'),periodTo=url.searchParams.get('to');
     const requestedDays=Number(url.searchParams.get('days'));
     if(Number.isFinite(requestedDays)&&requestedDays>=1&&requestedDays<=31){const range=moscowDateRange(requestedDays);periodFrom=range.from;periodTo=range.to;}
     if(/^\d{4}-\d{2}-\d{2}$/.test(periodFrom||'')&&/^\d{4}-\d{2}-\d{2}$/.test(periodTo||'')&&periodFrom<=periodTo){
-      const periodRows=db.prepare(`SELECT campaign_id,SUM(views) views,SUM(clicks) clicks,SUM(orders) orders,SUM(spend) spend,SUM(revenue) revenue,COUNT(*) days FROM campaign_daily_stats WHERE stat_date BETWEEN ? AND ? GROUP BY campaign_id`).all(periodFrom,periodTo),byCampaign=new Map(periodRows.map(row=>[Number(row.campaign_id),row]));
+      const periodRows=db.prepare(`SELECT campaign_id,SUM(views) views,SUM(clicks) clicks,SUM(orders) orders,SUM(spend) spend,SUM(revenue) revenue,COUNT(*) days FROM campaign_daily_stats WHERE legal_entity_id=? AND stat_date BETWEEN ? AND ? GROUP BY campaign_id`).all(entityId,periodFrom,periodTo),byCampaign=new Map(periodRows.map(row=>[Number(row.campaign_id),row]));
       for(const campaign of campaigns){const metrics=byCampaign.get(Number(campaign.id));if(!metrics){campaign.metrics_available=0;continue}campaign.views=Number(metrics.views||0);campaign.orders=Number(metrics.orders||0);campaign.spend=Number(metrics.spend||0);campaign.revenue=Number(metrics.revenue||0);campaign.ctr=metrics.views?Number(metrics.clicks||0)*100/Number(metrics.views):0;campaign.drr=metrics.revenue?campaign.spend*100/campaign.revenue:(campaign.spend>0?999999:0);campaign.metrics_available=1;campaign.metrics_from=periodFrom;campaign.metrics_to=periodTo;}
     }
-    const operations=db.prepare(`SELECT * FROM operations ORDER BY id DESC LIMIT 100`).all();
+    const operations=db.prepare(`SELECT * FROM operations WHERE legal_entity_id=? ORDER BY id DESC LIMIT 100`).all(entityId);
     const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,auto_sync_enabled,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
-    return send(res,200,{campaigns,operations,settings:{...s,display_from:periodFrom||null,display_to:periodTo||null,live_deposits:process.env.WB_LIVE_DEPOSITS==='true',live_resume:process.env.WB_LIVE_RESUME==='true'}});
+    const entities=listLegalEntities(),entity=entities.find(x=>x.id===entityId);
+    return send(res,200,{campaigns,operations,entities,active_entity_id:entityId,settings:{...s,token_saved:entity?.token_saved||0,display_from:periodFrom||null,display_to:periodTo||null,live_deposits:process.env.WB_LIVE_DEPOSITS==='true',live_resume:process.env.WB_LIVE_RESUME==='true'}});
   }
-  if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataV2(url.searchParams.get('campaign_id'),url.searchParams.get('week')));
-  if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsDataV2(url.searchParams.get('from'),url.searchParams.get('to'),url.searchParams.get('campaign_id')));
+  if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataV2(url.searchParams.get('campaign_id'),url.searchParams.get('week'),activeEntityId(url)));
+  if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsDataV2(url.searchParams.get('from'),url.searchParams.get('to'),url.searchParams.get('campaign_id'),activeEntityId(url)));
   if (req.method==='GET' && url.pathname==='/api/shared/export') return send(res,200,sharedExport(url.searchParams.get('from'),url.searchParams.get('to')));
   if (req.method==='POST' && url.pathname==='/api/settings') {
     const current=db.prepare('SELECT * FROM settings WHERE id=1').get();
-    const token=typeof body.token==='string'&&body.token.trim()?encrypt(body.token.trim()):current.token_enc;
-    db.prepare('UPDATE settings SET token_enc=?,demo_mode=?,check_minutes=?,stats_days=?,auto_sync_enabled=?,updated_at=? WHERE id=1').run(token,body.demo_mode?1:0,clamp(body.check_minutes,1,1440),clamp(body.stats_days ?? current.stats_days ?? 7,1,31),body.auto_sync_enabled===false?0:1,now());
+    const entityId=Number(body.legal_entity_id)||Number(current.active_entity_id)||1;
+    if(typeof body.token==='string'&&body.token.trim())db.prepare('UPDATE legal_entities SET token_enc=?,updated_at=? WHERE id=?').run(encrypt(body.token.trim()),now(),entityId);
+    db.prepare('UPDATE settings SET active_entity_id=?,demo_mode=?,check_minutes=?,stats_days=?,auto_sync_enabled=?,updated_at=? WHERE id=1').run(entityId,body.demo_mode?1:0,clamp(body.check_minutes,1,1440),clamp(body.stats_days ?? current.stats_days ?? 7,1,31),body.auto_sync_enabled===false?0:1,now());
     return send(res,200,{ok:true});
   }
   const ruleMatch=url.pathname.match(/^\/api\/campaigns\/(\d+)\/rule$/);
@@ -113,7 +146,7 @@ async function api(req,res,url) {
   }
   if (req.method==='POST' && url.pathname==='/api/sync') {
     const alreadyRunning=Boolean(activeSync);
-    if(!alreadyRunning) syncCampaigns().catch(error=>console.error('Manual WB sync failed:',error));
+    if(!alreadyRunning) syncCampaigns(Number(body.legal_entity_id)||activeEntityId(url)).catch(error=>console.error('Manual WB sync failed:',error));
     return send(res,202,{ok:true,started:!alreadyRunning,running:true});
   }
   if (req.method==='POST' && url.pathname==='/api/run') { const result=await evaluateAll(); return send(res,200,result); }
@@ -175,7 +208,7 @@ async function pauseCampaign(c,before,reason) {
     const settings=db.prepare('SELECT * FROM settings WHERE id=1').get();
     if (!settings.demo_mode) {
       if (process.env.WB_LIVE_PAUSE!=='true') throw new Error('Боевое автоотключение выключено в .env');
-      await wbCommand(`/adv/v0/pause?id=${c.campaign_id}`,decrypt(settings.token_enc));
+      await wbCommand(`/adv/v0/pause?id=${c.campaign_id}`,tokenForEntity(c.legal_entity_id));
     }
     db.prepare(`UPDATE campaigns SET status='paused',resume_after_at=NULL,updated_at=? WHERE id=?`).run(now(),c.campaign_id);
     // A safety latch: an automatically paused campaign must not be funded or
@@ -200,7 +233,7 @@ async function depositCampaign(c,before,scheduleResume) {
     if (settings.demo_mode) after=before+c.deposit_amount;
     else {
       if (process.env.WB_LIVE_DEPOSITS!=='true') { log(c,'blocked','Боевые пополнения выключены в .env',0,before,before,idem); return 'skipped'; }
-      const token=decrypt(settings.token_enc); const response=await wb(`/adv/v1/budget/deposit?id=${c.campaign_id}`,token,{sum:c.deposit_amount,type:c.funding_type,return:true}); after=Number(response.total);
+      const token=tokenForEntity(c.legal_entity_id); const response=await wb(`/adv/v1/budget/deposit?id=${c.campaign_id}`,token,{sum:c.deposit_amount,type:c.funding_type,return:true}); after=Number(response.total);
     }
     const resumeAfter=scheduleResume?new Date(Date.now()+Number(c.resume_delay_seconds||15)*1000).toISOString():null;
     db.prepare('UPDATE campaigns SET budget=?,resume_after_at=?,updated_at=? WHERE id=?').run(after,resumeAfter,now(),c.campaign_id);
@@ -217,7 +250,7 @@ async function resumeCampaign(c,before) {
     const settings=db.prepare('SELECT * FROM settings WHERE id=1').get();let confirmedBudget=before;
     if (!settings.demo_mode) {
       if (process.env.WB_LIVE_RESUME!=='true') throw new Error('Боевое возобновление выключено в .env');
-      const token=decrypt(settings.token_enc),budget=await wb(`/adv/v1/budget?id=${c.campaign_id}`,token);
+      const token=tokenForEntity(c.legal_entity_id),budget=await wb(`/adv/v1/budget?id=${c.campaign_id}`,token);
       confirmedBudget=Number(budget.total||0);
       if (confirmedBudget<=0) {
         db.prepare('UPDATE campaigns SET resume_after_at=?,updated_at=? WHERE id=?').run(new Date(Date.now()+30000).toISOString(),now(),c.campaign_id);
@@ -235,16 +268,17 @@ async function resumeCampaign(c,before) {
 }
 
 let activeSync=null;
-async function syncCampaigns() {
+async function syncCampaigns(entityId=1) {
   if(activeSync) return activeSync;
-  activeSync=doSyncCampaigns();
+  activeSync=doSyncCampaigns(entityId);
   try { return await activeSync; } finally { activeSync=null; }
 }
-async function doSyncCampaigns() {
+async function doSyncCampaigns(entityId) {
   const s=db.prepare('SELECT * FROM settings WHERE id=1').get();
   if (s.demo_mode) { seedDemo(); return; }
-  if (!s.token_enc) throw new Error('Сначала сохраните токен WB');
-  const token=decrypt(s.token_enc);
+  const entity=db.prepare('SELECT * FROM legal_entities WHERE id=? AND enabled=1').get(entityId);
+  if (!entity?.token_enc) throw new Error('Сначала сохраните токен WB для выбранного юрлица');
+  const token=decrypt(entity.token_enc);
   const response=await wb('/api/advert/v2/adverts?statuses=9,11&order=change&direction=desc',token);
   const root=Array.isArray(response)?response:(Array.isArray(response?.adverts)?response.adverts:[]);
   const campaigns=[];
@@ -257,17 +291,17 @@ async function doSyncCampaigns() {
   db.prepare(`DELETE FROM campaigns WHERE source='demo'`).run();
   // Campaigns not returned for statuses 9/11 are archived. Keep their rules in
   // the database, but hide them from the site and browser extension.
-  db.prepare(`UPDATE campaigns SET status='archived' WHERE source='wb'`).run();
+  db.prepare(`UPDATE campaigns SET status='archived' WHERE source='wb' AND legal_entity_id=?`).run(entityId);
   for (const a of campaigns) {
     const id=Number(a.advertId || a.advert_id || a.id); if (!id) continue;
     const name=a.name || a.settings?.name || `Кампания ${id}`;
-    db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at) VALUES(?,?,?,0,0,0,'wb',?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,source='wb',updated_at=excluded.updated_at`).run(id,name,Number(a.status)===9?'active':'paused',now());
+    db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at,legal_entity_id) VALUES(?,?,?,0,0,0,'wb',?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,source='wb',updated_at=excluded.updated_at,legal_entity_id=excluded.legal_entity_id`).run(id,name,Number(a.status)===9?'active':'paused',now(),entityId);
   }
   await syncCampaignBids(token,campaigns);
   // Statistics has the strictest WB limit, so request it before the per-campaign
   // budget calls consume the seller's shared promotion API allowance.
   await new Promise(resolve=>setTimeout(resolve,21000));
-  await syncStatistics(token, campaigns.map(a=>Number(a.advertId || a.advert_id || a.id)).filter(Boolean), s.stats_days || 7);
+  await syncStatistics(token, campaigns.map(a=>Number(a.advertId || a.advert_id || a.id)).filter(Boolean), s.stats_days || 7,entityId);
   for (const a of campaigns) {
     const id=Number(a.advertId || a.advert_id || a.id); if (!id) continue;
     const budget=await wb(`/adv/v1/budget?id=${id}`,token);
@@ -300,7 +334,7 @@ function wbStatMetrics(source){
   return Object.fromEntries(Object.keys(direct).map(key=>[key,direct[key]||nested[key]||0]));
 }
 
-async function syncStatistics(token, ids, days) {
+async function syncStatistics(token, ids, days,entityId=1) {
   const end=new Date(),begin=new Date(end),decisionBegin=new Date(end),decisionDays=Math.max(1,Math.min(31,Number(days)||7));
   // One WB request costs the same rate-limit slot for one or 31 days. Keep the
   // complete allowed history so the extension can mirror the period selected
@@ -330,10 +364,10 @@ async function syncStatistics(token, ids, days) {
         const statDate=String(day.date||'').slice(0,10);if(!statDate)continue;
         const dayMetrics=wbStatMetrics(day),daySpend=dayMetrics.spend,dayRevenue=dayMetrics.revenue,dayViews=dayMetrics.views,dayClicks=dayMetrics.clicks,dayOrders=dayMetrics.orders;
         const dayCtr=Number.isFinite(Number(day.ctr))?Number(day.ctr):(dayViews?dayClicks/dayViews*100:0),dayDrr=dayRevenue?daySpend/dayRevenue*100:(daySpend?999999:0);
-        db.prepare(`INSERT INTO campaign_daily_stats(campaign_id,stat_date,views,clicks,orders,spend,revenue,ctr,drr,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id,stat_date) DO UPDATE SET views=excluded.views,clicks=excluded.clicks,orders=excluded.orders,spend=excluded.spend,revenue=excluded.revenue,ctr=excluded.ctr,drr=excluded.drr,updated_at=excluded.updated_at`).run(id,statDate,dayViews,dayClicks,dayOrders,daySpend,dayRevenue,dayCtr,dayDrr,now());
+        db.prepare(`INSERT INTO campaign_daily_stats(campaign_id,stat_date,views,clicks,orders,spend,revenue,ctr,drr,updated_at,legal_entity_id) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id,stat_date) DO UPDATE SET views=excluded.views,clicks=excluded.clicks,orders=excluded.orders,spend=excluded.spend,revenue=excluded.revenue,ctr=excluded.ctr,drr=excluded.drr,updated_at=excluded.updated_at,legal_entity_id=excluded.legal_entity_id`).run(id,statDate,dayViews,dayClicks,dayOrders,daySpend,dayRevenue,dayCtr,dayDrr,now(),entityId);
       }
       const today=days.find(day=>String(day.date||'').slice(0,10)===endDate);
-      if(today){const campaign=db.prepare('SELECT name,status FROM campaigns WHERE id=?').get(id)||{},todayMetrics=wbStatMetrics(today);db.prepare(`INSERT OR IGNORE INTO hourly_snapshots(campaign_id,campaign_name,status,snapshot_at,impressions_total,clicks_total,quality,note) VALUES(?,?,?,?,?,?,'ok','WB API')`).run(id,campaign.name||'',campaign.status||'',moscowTimestamp(),todayMetrics.views,todayMetrics.clicks);}
+      if(today){const campaign=db.prepare('SELECT name,status FROM campaigns WHERE id=?').get(id)||{},todayMetrics=wbStatMetrics(today);db.prepare(`INSERT OR IGNORE INTO hourly_snapshots(campaign_id,campaign_name,status,snapshot_at,impressions_total,clicks_total,quality,note,legal_entity_id) VALUES(?,?,?,?,?,?,'ok','WB API',?)`).run(id,campaign.name||'',campaign.status||'',moscowTimestamp(),todayMetrics.views,todayMetrics.clicks,entityId);}
     }
   }
 }
@@ -356,7 +390,7 @@ async function wbCommand(path,token){
   if(!r.ok)throw new Error(`WB API: ${r.status} ${await r.text()}`);
   const text=await r.text();return text?JSON.parse(text):{};
 }
-function logAction(c,action,status,reason,amount,before,after,idem=null){db.prepare(`INSERT OR IGNORE INTO operations(campaign_id,campaign_name,created_at,action,status,reason,amount,budget_before,budget_after,ctr,drr,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`).run(c.campaign_id||c.id,c.name,now(),action,status,reason,amount,before,after,c.ctr,c.drr,idem);}
+function logAction(c,action,status,reason,amount,before,after,idem=null){db.prepare(`INSERT OR IGNORE INTO operations(campaign_id,campaign_name,created_at,action,status,reason,amount,budget_before,budget_after,ctr,drr,idempotency_key,legal_entity_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(c.campaign_id||c.id,c.name,now(),action,status,reason,amount,before,after,c.ctr,c.drr,idem,Number(c.legal_entity_id)||1);}
 function log(c,status,reason,amount,before,after,idem=null){logAction(c,'evaluation',status,reason,amount,before,after,idem);}
 function seedDemo(){if(db.prepare('SELECT count(*) n FROM campaigns').get().n)return;const q=db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,spend,revenue,source,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`);[[9134001,'Кроссовки — Поиск','active',320,7.4,8.1,8100,100000],[9134002,'Рюкзаки — Каталог','active',870,3.8,14.6,7300,50000],[9134003,'Футболки — Авто','active',190,6.2,10.9,5450,50000]].forEach(x=>q.run(...x,'demo',now()));}
 function importDiaryData(){
@@ -372,13 +406,13 @@ function importDiaryData(){
 function parseCsv(text){const rows=[];let row=[],field='',quoted=false;for(let i=0;i<text.length;i++){const c=text[i];if(c==='"'){if(quoted&&text[i+1]==='"'){field+='"';i++}else quoted=!quoted}else if(c===','&&!quoted){row.push(field);field=''}else if((c==='\n'||c==='\r')&&!quoted){if(c==='\r'&&text[i+1]==='\n')i++;row.push(field);field='';if(row.some(Boolean))rows.push(row);row=[]}else field+=c}if(field||row.length){row.push(field);rows.push(row)}if(!rows.length)return[];const headers=rows.shift().map((x,i)=>i===0?x.replace(/^\uFEFF/,''):x);return rows.map(values=>Object.fromEntries(headers.map((h,i)=>[h,values[i]??''])))}
 function hourlyData(campaignId,week){const campaigns=db.prepare(`SELECT id,name,status FROM campaigns WHERE status<>'archived' ORDER BY name`).all();const id=Number(campaignId)||Number(campaigns[0]?.id||0);const start=/^\d{4}-\d{2}-\d{2}$/.test(week||'')?week:weekMonday();const end=new Date(`${start}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+7);const rows=db.prepare(`SELECT * FROM hourly_snapshots WHERE campaign_id=? AND snapshot_at>=? AND snapshot_at<? ORDER BY snapshot_at`).all(id,`${start} 00:00:00`,`${end.toISOString().slice(0,10)} 00:00:00`);const cells=[];let previous=null,previousDay='';for(const r of rows){const day=r.snapshot_at.slice(0,10),hour=Number(r.snapshot_at.slice(11,13));let views=null,clicks=null,uncertain=r.quality!=='ok',note=r.note||'';if(previous&&previousDay===day&&r.impressions_total!=null&&previous.impressions_total!=null){views=Math.max(0,r.impressions_total-previous.impressions_total);clicks=Math.max(0,r.clicks_total-previous.clicks_total)}else if(r.impressions_total!=null){views=r.impressions_total;clicks=r.clicks_total;uncertain=true;note=note||'Первый снимок дня'}cells.push({date:day,hour,views,clicks,uncertain,note});previous=r;previousDay=day}return{campaigns,selected_id:id,week:start,cells};}
 function analyticsData(from,to){const end=to&&/^\d{4}-\d{2}-\d{2}$/.test(to)?to:ymdMoscow(new Date()),start=from&&/^\d{4}-\d{2}-\d{2}$/.test(from)?from:(()=>{const d=new Date();d.setUTCDate(d.getUTCDate()-6);return ymdMoscow(d)})();const rows=db.prepare(`SELECT d.campaign_id,COALESCE(c.name,'Кампания '||d.campaign_id) name,SUM(d.views) views,SUM(d.clicks) clicks,SUM(d.orders) orders,SUM(d.spend) spend,SUM(d.revenue) revenue,CASE WHEN SUM(d.views)>0 THEN SUM(d.clicks)*100.0/SUM(d.views) ELSE 0 END ctr,CASE WHEN SUM(d.revenue)>0 THEN SUM(d.spend)*100.0/SUM(d.revenue) ELSE 0 END drr FROM campaign_daily_stats d LEFT JOIN campaigns c ON c.id=d.campaign_id WHERE d.stat_date BETWEEN ? AND ? GROUP BY d.campaign_id,c.name ORDER BY spend DESC`).all(start,end);return{from:start,to:end,rows};}
-function hourlyDataV2(campaignId,week){
-  const campaigns=db.prepare(`SELECT c.id,c.name,c.status FROM campaigns c WHERE c.status<>'archived' AND EXISTS(SELECT 1 FROM hourly_snapshots h WHERE h.campaign_id=c.id) ORDER BY c.name`).all();
+function hourlyDataV2(campaignId,week,entityId=1){
+  const campaigns=db.prepare(`SELECT c.id,c.name,c.status FROM campaigns c WHERE c.status<>'archived' AND c.legal_entity_id=? AND EXISTS(SELECT 1 FROM hourly_snapshots h WHERE h.campaign_id=c.id AND h.legal_entity_id=?) ORDER BY c.name`).all(entityId,entityId);
   const id=Number(campaignId)||Number(campaigns[0]?.id||0);
-  const available=db.prepare(`SELECT DISTINCT substr(h.snapshot_at,1,10) day FROM hourly_snapshots h JOIN campaigns c ON c.id=h.campaign_id WHERE c.status<>'archived' ORDER BY day DESC`).all().map(x=>mondayOf(x.day));
+  const available=db.prepare(`SELECT DISTINCT substr(h.snapshot_at,1,10) day FROM hourly_snapshots h JOIN campaigns c ON c.id=h.campaign_id WHERE c.status<>'archived' AND h.legal_entity_id=? ORDER BY day DESC`).all(entityId).map(x=>mondayOf(x.day));
   const weeks=[...new Set([weekMonday(),...available])].sort().reverse().map(value=>({value,label:weekLabel(value)}));
   const start=/^\d{4}-\d{2}-\d{2}$/.test(week||'')?mondayOf(week):weeks[0]?.value||weekMonday(),end=new Date(`${start}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+7);
-  const rows=db.prepare(`SELECT * FROM hourly_snapshots WHERE campaign_id=? AND snapshot_at>=? AND snapshot_at<? ORDER BY snapshot_at`).all(id,`${start} 00:00:00`,`${end.toISOString().slice(0,10)} 00:00:00`),cells=[];
+  const rows=db.prepare(`SELECT * FROM hourly_snapshots WHERE campaign_id=? AND legal_entity_id=? AND snapshot_at>=? AND snapshot_at<? ORDER BY snapshot_at`).all(id,entityId,`${start} 00:00:00`,`${end.toISOString().slice(0,10)} 00:00:00`),cells=[];
   // Several syncs can happen within one hour. Keep the latest cumulative
   // snapshot for each hour, so the resulting delta represents the whole hour.
   const latestByHour=new Map();
@@ -388,9 +422,9 @@ function hourlyDataV2(campaignId,week){
   for(const r of rows){const day=r.snapshot_at.slice(0,10),hour=Number(r.snapshot_at.slice(11,13));let views=null,clicks=null,uncertain=r.quality!=='ok',note=r.note||'';if(previous&&previousDay===day&&r.impressions_total!=null&&previous.impressions_total!=null){views=Math.max(0,r.impressions_total-previous.impressions_total);clicks=Math.max(0,r.clicks_total-previous.clicks_total)}else if(r.impressions_total!=null){views=r.impressions_total;clicks=r.clicks_total;uncertain=true;note=note||'Первый снимок дня'}cells.push({date:day,hour,views,clicks,uncertain,note});previous=r;previousDay=day}
   return{campaigns,weeks,selected_id:id,week:start,cells};
 }
-function analyticsDataV2(from,to,campaignId){
+function analyticsDataV2(from,to,campaignId,entityId=1){
   const end=to&&/^\d{4}-\d{2}-\d{2}$/.test(to)?to:ymdMoscow(new Date()),start=from&&/^\d{4}-\d{2}-\d{2}$/.test(from)?from:(()=>{const d=new Date();d.setUTCDate(d.getUTCDate()-6);return ymdMoscow(d)})();
-  const stats=db.prepare(`SELECT d.campaign_id,SUM(d.views) views,SUM(d.clicks) clicks,SUM(d.orders) orders,SUM(d.spend) spend,SUM(d.revenue) revenue,CASE WHEN SUM(d.views)>0 THEN SUM(d.clicks)*100.0/SUM(d.views) ELSE 0 END ctr,CASE WHEN SUM(d.revenue)>0 THEN SUM(d.spend)*100.0/SUM(d.revenue) ELSE 0 END drr FROM campaign_daily_stats d JOIN campaigns c ON c.id=d.campaign_id WHERE d.stat_date BETWEEN ? AND ? AND c.status<>'archived' GROUP BY d.campaign_id`).all(start,end);
+  const stats=db.prepare(`SELECT d.campaign_id,SUM(d.views) views,SUM(d.clicks) clicks,SUM(d.orders) orders,SUM(d.spend) spend,SUM(d.revenue) revenue,CASE WHEN SUM(d.views)>0 THEN SUM(d.clicks)*100.0/SUM(d.views) ELSE 0 END ctr,CASE WHEN SUM(d.revenue)>0 THEN SUM(d.spend)*100.0/SUM(d.revenue) ELSE 0 END drr FROM campaign_daily_stats d JOIN campaigns c ON c.id=d.campaign_id WHERE d.legal_entity_id=? AND d.stat_date BETWEEN ? AND ? AND c.status<>'archived' GROUP BY d.campaign_id`).all(entityId,start,end);
   const rows=stats.map(s=>{const c=db.prepare(`SELECT name,status FROM campaigns WHERE id=?`).get(s.campaign_id)||{},b=db.prepare(`SELECT COUNT(DISTINCT nm_id) products,MIN(bid_rub) bid_min,MAX(bid_rub) bid_max FROM campaign_bids WHERE campaign_id=?`).get(s.campaign_id),ch=db.prepare(`SELECT COUNT(DISTINCT nm_id) changed_products,MAX(changed_at) last_bid_change FROM campaign_bid_changes WHERE campaign_id=? AND changed_at BETWEEN ? AND ?`).get(s.campaign_id,`${start} 00:00:00`,`${end} 23:59:59`);return{...s,name:c.name||`Кампания ${s.campaign_id}`,status:c.status||'',type:'CPC',products:b.products||0,bid_min:b.bid_min,bid_max:b.bid_max,changed_products:ch.changed_products||0,last_bid_change:ch.last_bid_change}}).sort((a,b)=>b.spend-a.spend);
   const selected=Number(campaignId)||Number(rows[0]?.campaign_id||0);
   const products=db.prepare(`SELECT b.*,ch.old_value,ch.new_value,ch.changed_at,(SELECT COUNT(*) FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ?) changes FROM campaign_bids b LEFT JOIN campaign_bid_changes ch ON ch.rowid=(SELECT x.rowid FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ? ORDER BY x.changed_at DESC LIMIT 1) WHERE b.campaign_id=? ORDER BY b.nm_id,b.placement`).all(`${start} 00:00:00`,`${end} 23:59:59`,`${start} 00:00:00`,`${end} 23:59:59`,selected);
@@ -402,6 +436,13 @@ function weekLabel(value){const a=new Date(`${value}T00:00:00Z`),b=new Date(a);b
 function moscowDateRange(days){const to=ymdMoscow(new Date()),fromDate=new Date(`${to}T00:00:00Z`);fromDate.setUTCDate(fromDate.getUTCDate()-(Math.max(1,Math.min(31,Number(days)||7))-1));return{from:fromDate.toISOString().slice(0,10),to}}
 function campaignMetricsForDays(campaignId,days){const range=moscowDateRange(days),row=db.prepare(`SELECT SUM(views) views,SUM(clicks) clicks,SUM(orders) orders,SUM(spend) spend,SUM(revenue) revenue,COUNT(*) records FROM campaign_daily_stats WHERE campaign_id=? AND stat_date BETWEEN ? AND ?`).get(campaignId,range.from,range.to),views=Number(row?.views||0),clicks=Number(row?.clicks||0),orders=Number(row?.orders||0),spend=Number(row?.spend||0),revenue=Number(row?.revenue||0);return{available:Number(row?.records||0)>0,from:range.from,to:range.to,views,clicks,orders,spend,revenue,ctr:views?clicks*100/views:0,drr:revenue?spend*100/revenue:(spend>0?999999:0)}}
 function migrateColumn(table,column,definition){const columns=db.prepare(`PRAGMA table_info(${table})`).all();if(!columns.some(x=>x.name===column))db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);}
+function ensureDefaultLegalEntity(){
+  if(!db.prepare('SELECT id FROM legal_entities LIMIT 1').get()){const s=db.prepare('SELECT token_enc FROM settings WHERE id=1').get()||{};db.prepare('INSERT INTO legal_entities(id,name,token_enc,enabled,created_at,updated_at) VALUES(1,?,?,1,?,?)').run('Основное юрлицо',s.token_enc||null,now(),now());}
+  const s=db.prepare('SELECT active_entity_id FROM settings WHERE id=1').get();if(!s?.active_entity_id)db.prepare('UPDATE settings SET active_entity_id=1 WHERE id=1').run();
+}
+function listLegalEntities(){return db.prepare('SELECT id,name,enabled,token_enc IS NOT NULL AS token_saved,created_at,updated_at FROM legal_entities ORDER BY id').all().map(x=>({...x,id:Number(x.id)}));}
+function activeEntityId(url){const requested=Number(url?.searchParams?.get('legal_entity_id'));if(requested&&db.prepare('SELECT id FROM legal_entities WHERE id=?').get(requested))return requested;return Number(db.prepare('SELECT active_entity_id FROM settings WHERE id=1').get()?.active_entity_id)||1;}
+function tokenForEntity(id){const entity=db.prepare('SELECT token_enc FROM legal_entities WHERE id=? AND enabled=1').get(Number(id)||1);return decrypt(entity?.token_enc);}
 function validTime(value,fallback){return typeof value==='string'&&/^([01]\d|2[0-3]):[0-5]\d$/.test(value)?value:fallback;}
 function ymdMoscow(date){return new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit',day:'2-digit'}).format(date);}
 function moscowTimestamp(date=new Date()){const parts=new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(date);return parts.replace('T',' ')}
@@ -431,7 +472,7 @@ let running=false,lastAutomaticRun=0;setInterval(async()=>{
   try {
     // A closed browser must not stop automation: refresh WB data on the server
     // before every decision. If sync fails, evaluation is skipped safely.
-    if(!settings.demo_mode) await syncCampaigns();
+    if(!settings.demo_mode) for(const entity of listLegalEntities().filter(x=>x.enabled&&x.token_saved))await syncCampaigns(entity.id);
     await evaluateAll();
   } catch(e) { console.error('Automatic cycle skipped:',e); }
   finally { running=false; }

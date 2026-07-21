@@ -2,9 +2,10 @@
   if(document.querySelector('#wba-btn'))return;
   const btn=document.createElement('button');btn.id='wba-btn';btn.textContent='W AutoFund';
   const panel=document.createElement('aside');panel.id='wba-panel';
-  panel.innerHTML='<header><div><b>WB AutoFund</b><small>Автопополнение кампаний</small></div><button id="wba-close">×</button></header><div id="wba-body" class="wba-message">Откройте панель</div>';
+  panel.innerHTML='<header><div><b>WB AutoFund</b><small>Автопополнение кампаний</small></div><select id="wba-entity" title="Юрлицо"></select><button id="wba-close">×</button></header><div id="wba-body" class="wba-message">Откройте панель</div>';
   document.documentElement.append(btn,panel);
-  let displayDays=7,loadedCampaigns=[];chrome.storage.local.get({displayDays:7},value=>{displayDays=Number(value.displayDays)||7});
+  panel.querySelector('#wba-entity').style.cssText='width:155px;max-width:38%;padding:8px;border:1px solid #ddd;border-radius:8px;background:#fff;font:600 12px Arial;color:#302a37';
+  let displayDays=7,selectedEntityId=0,loadedCampaigns=[];chrome.storage.local.get({displayDays:7,selectedEntityId:0},value=>{displayDays=Number(value.displayDays)||7;selectedEntityId=Number(value.selectedEntityId)||0});
   const toggle=()=>{panel.classList.toggle('open');if(panel.classList.contains('open'))load()};
   btn.onclick=toggle;panel.querySelector('#wba-close').onclick=toggle;
   chrome.runtime.onMessage.addListener(message=>{if(message.type==='toggle')toggle();if(message.type==='refresh'&&panel.classList.contains('open'))load()});
@@ -16,9 +17,10 @@
   }
   async function load(){
     const body=panel.querySelector('#wba-body');body.className='wba-message';body.textContent='Загрузка…';
-    let r;try{r=await chrome.runtime.sendMessage({type:'api',path:`/api/dashboard?days=${displayDays}`})}catch(error){body.textContent=error.message||'Не удалось связаться с расширением';return}
+    let r;try{r=await chrome.runtime.sendMessage({type:'api',path:`/api/dashboard?days=${displayDays}${selectedEntityId?`&legal_entity_id=${selectedEntityId}`:''}`})}catch(error){body.textContent=error.message||'Не удалось связаться с расширением';return}
     if(!r?.ok){body.textContent=r?.error||'Настройте подключение через значок расширения';return}
     loadedCampaigns=r.data.campaigns||[];
+    const entitySelect=panel.querySelector('#wba-entity'),entities=r.data.entities||[];selectedEntityId=Number(r.data.active_entity_id||selectedEntityId||entities[0]?.id||0);entitySelect.innerHTML=entities.map(entity=>`<option value="${entity.id}">${esc(entity.name)}</option>`).join('');entitySelect.value=String(selectedEntityId);entitySelect.onchange=()=>{selectedEntityId=Number(entitySelect.value);chrome.storage.local.set({selectedEntityId});load()};
     body.className='';body.innerHTML='<div class="wba-search"><input type="search" placeholder="Поиск по названию или ID"><select><option value="all">Все кампании</option><option value="enabled">Автопополнение включено</option><option value="setup">Нужно настроить</option></select><small></small></div><div class="wba-cards"></div>';
     const period=document.createElement('label');period.className='wba-period';period.style.cssText='display:flex;flex-direction:column;gap:5px;margin-bottom:10px;color:#777;font-size:11px';period.innerHTML=`Период отображения CTR и ДРР<select><option value="1">Сегодня</option><option value="3">3 дня</option><option value="7">7 дней</option><option value="14">14 дней</option><option value="30">30 дней</option></select>`;const periodSelect=period.querySelector('select');periodSelect.style.cssText='padding:9px;border:1px solid #ddd;border-radius:8px;background:white';periodSelect.value=String(displayDays);periodSelect.onchange=()=>{displayDays=Number(periodSelect.value);chrome.storage.local.set({displayDays});load()};body.prepend(period);
     const input=body.querySelector('.wba-search input'),filter=body.querySelector('.wba-search select'),cards=body.querySelector('.wba-cards'),count=body.querySelector('.wba-search small');
