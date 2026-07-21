@@ -66,6 +66,10 @@ migrateColumn('rules','pause_use_min_views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','pause_min_views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','pause_use_min_orders','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','pause_min_orders','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','schedule_enabled','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','schedule_windows','TEXT NOT NULL DEFAULT \'[]\'');
+migrateColumn('rules','schedule_auto_resume','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('campaigns','schedule_paused','INTEGER NOT NULL DEFAULT 0');
 ensureDefaultLegalEntity();
 seedDemo();
 // A large Diary archive can contain hundreds of thousands of rows. Importing it
@@ -110,7 +114,7 @@ async function api(req,res,url) {
   }
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
     const entityId=activeEntityId(url);
-    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.auto_resume,r.resume_daily_limit,r.resume_delay_seconds,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.metrics_days,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type,r.auto_pause,r.pause_use_max_drr,r.pause_max_drr,r.pause_use_min_ctr,r.pause_min_ctr,r.pause_use_min_views,r.pause_min_views,r.pause_use_min_orders,r.pause_min_orders FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' AND c.legal_entity_id=? ORDER BY c.id`).all(entityId);
+    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.auto_resume,r.resume_daily_limit,r.resume_delay_seconds,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.metrics_days,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type,r.auto_pause,r.pause_use_max_drr,r.pause_max_drr,r.pause_use_min_ctr,r.pause_min_ctr,r.pause_use_min_views,r.pause_min_views,r.pause_use_min_orders,r.pause_min_orders,r.schedule_enabled,r.schedule_windows,r.schedule_auto_resume FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' AND c.legal_entity_id=? ORDER BY c.id`).all(entityId);
     let periodFrom=url.searchParams.get('from'),periodTo=url.searchParams.get('to');
     const requestedDays=Number(url.searchParams.get('days'));
     if(Number.isFinite(requestedDays)&&requestedDays>=1&&requestedDays<=31){const range=moscowDateRange(requestedDays);periodFrom=range.from;periodTo=range.to;}
@@ -139,6 +143,7 @@ async function api(req,res,url) {
     const currentRule=db.prepare('SELECT metrics_days,auto_resume,resume_daily_limit,resume_delay_seconds FROM rules WHERE campaign_id=?').get(id);
     db.prepare(`INSERT INTO rules(campaign_id,enabled,auto_resume,resume_daily_limit,resume_delay_seconds,use_max_drr,max_drr,use_min_ctr,min_ctr,use_min_views,min_views,use_min_orders,min_orders,metrics_days,use_time_window,time_from,time_to,min_budget,deposit_amount,daily_limit,funding_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id) DO UPDATE SET enabled=excluded.enabled,auto_resume=excluded.auto_resume,resume_daily_limit=excluded.resume_daily_limit,resume_delay_seconds=excluded.resume_delay_seconds,use_max_drr=excluded.use_max_drr,max_drr=excluded.max_drr,use_min_ctr=excluded.use_min_ctr,min_ctr=excluded.min_ctr,use_min_views=excluded.use_min_views,min_views=excluded.min_views,use_min_orders=excluded.use_min_orders,min_orders=excluded.min_orders,metrics_days=excluded.metrics_days,use_time_window=excluded.use_time_window,time_from=excluded.time_from,time_to=excluded.time_to,min_budget=excluded.min_budget,deposit_amount=excluded.deposit_amount,daily_limit=excluded.daily_limit,funding_type=excluded.funding_type,updated_at=excluded.updated_at`).run(id,body.enabled?1:0,body.auto_resume==null?Number(currentRule?.auto_resume||0):(body.auto_resume?1:0),clamp(body.resume_daily_limit??currentRule?.resume_daily_limit??1,1,24),clamp(body.resume_delay_seconds??currentRule?.resume_delay_seconds??15,5,300),body.use_max_drr!==false?1:0,positive(body.max_drr),body.use_min_ctr!==false?1:0,positive(body.min_ctr),body.use_min_views?1:0,Math.round(positive(body.min_views)),body.use_min_orders?1:0,Math.round(positive(body.min_orders)),clamp(body.metrics_days??currentRule?.metrics_days??7,1,31),body.use_time_window?1:0,validTime(body.time_from,'00:00'),validTime(body.time_to,'23:59'),positive(body.min_budget),Math.round(positive(body.deposit_amount)),clamp(body.daily_limit,1,100),[0,1,3].includes(Number(body.funding_type))?Number(body.funding_type):1,now());
     db.prepare(`UPDATE rules SET auto_pause=?,pause_use_max_drr=?,pause_max_drr=?,pause_use_min_ctr=?,pause_min_ctr=?,pause_use_min_views=?,pause_min_views=?,pause_use_min_orders=?,pause_min_orders=? WHERE campaign_id=?`).run(body.auto_pause?1:0,body.pause_use_max_drr?1:0,positive(body.pause_max_drr),body.pause_use_min_ctr?1:0,positive(body.pause_min_ctr),body.pause_use_min_views?1:0,Math.round(positive(body.pause_min_views)),body.pause_use_min_orders?1:0,Math.round(positive(body.pause_min_orders)),id);
+    if(Object.hasOwn(body,'schedule_enabled')||Object.hasOwn(body,'schedule_windows')||Object.hasOwn(body,'schedule_auto_resume'))db.prepare(`UPDATE rules SET schedule_enabled=?,schedule_windows=?,schedule_auto_resume=? WHERE campaign_id=?`).run(body.schedule_enabled?1:0,JSON.stringify(normalizeScheduleWindows(body.schedule_windows)),body.schedule_auto_resume===false?0:1,id);
     setTimeout(()=>evaluateCampaign(id).catch(error=>console.error(`Immediate evaluation ${id} failed:`,error)),100);
     const settings=db.prepare('SELECT demo_mode FROM settings WHERE id=1').get();
     const liveDepositReady=Boolean(settings.demo_mode)||process.env.WB_LIVE_DEPOSITS==='true';
@@ -154,19 +159,23 @@ async function api(req,res,url) {
 }
 
 async function evaluateAll() {
-  const rows=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE r.enabled=1 OR r.auto_resume=1 OR r.auto_pause=1`).all();
+  const rows=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE r.enabled=1 OR r.auto_resume=1 OR r.auto_pause=1 OR r.schedule_enabled=1 OR c.schedule_paused=1`).all();
   let deposited=0,resumed=0,skipped=0;
   for (const c of rows) { const result=await evaluate(c); result==='deposited'?deposited++:result==='resumed'?resumed++:skipped++; }
   return {checked:rows.length,deposited,resumed,skipped};
 }
 
 async function evaluateCampaign(campaignId) {
-  const row=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE c.id=? AND (r.enabled=1 OR r.auto_resume=1 OR r.auto_pause=1)`).get(campaignId);
+  const row=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE c.id=? AND (r.enabled=1 OR r.auto_resume=1 OR r.auto_pause=1 OR r.schedule_enabled=1 OR c.schedule_paused=1)`).get(campaignId);
   return row?evaluate(row):'skipped';
 }
 
 async function evaluate(c) {
   const before=Number(c.budget),periodMetrics=campaignMetricsForDays(c.campaign_id,c.metrics_days||7);
+  const scheduledNow=Boolean(c.schedule_enabled)&&isInsideSchedule(c.schedule_windows);
+  if(scheduledNow&&c.status==='active')return pauseCampaignBySchedule(c,before);
+  if(!scheduledNow&&c.schedule_paused&&c.schedule_auto_resume)return resumeCampaignBySchedule(c,before);
+  if(scheduledNow||c.schedule_paused)return 'skipped';
   c.metrics_available=periodMetrics.available?1:0;c.ctr=periodMetrics.ctr;c.drr=periodMetrics.drr;c.views=periodMetrics.views;c.orders=periodMetrics.orders;
   const metrics={ctr:Number(c.ctr),drr:Number(c.drr)};
   if (c.status==='active' && c.auto_pause) {
@@ -217,6 +226,15 @@ async function pauseCampaign(c,before,reason) {
     logAction(c,'pause','paused',`${settings.demo_mode?'Демо-автоотключение':'Кампания поставлена на паузу через WB API'}: ${reason}`,0,before,before,pauseKey);
     return 'paused';
   } catch(e) { logAction(c,'pause','error',e.message,0,before,before,pauseKey);return 'skipped'; }
+}
+
+async function pauseCampaignBySchedule(c,before){
+  const key=createHash('sha256').update(`schedule-pause:${c.campaign_id}:${moscowTimestamp().slice(0,16)}`).digest('hex');
+  try{const settings=db.prepare('SELECT demo_mode FROM settings WHERE id=1').get();if(!settings.demo_mode){if(process.env.WB_LIVE_PAUSE!=='true')throw new Error('Боевое автоотключение выключено в .env');await wbCommand(`/adv/v0/pause?id=${c.campaign_id}`,tokenForEntity(c.legal_entity_id));}db.prepare(`UPDATE campaigns SET status='paused',schedule_paused=1,resume_after_at=NULL,updated_at=? WHERE id=?`).run(now(),c.campaign_id);logAction(c,'schedule_pause','paused','Пауза по расписанию МСК',0,before,before,key);return'paused'}catch(error){logAction(c,'schedule_pause','error',error.message,0,before,before,key);return'skipped'}
+}
+async function resumeCampaignBySchedule(c,before){
+  const key=createHash('sha256').update(`schedule-resume:${c.campaign_id}:${moscowTimestamp().slice(0,16)}`).digest('hex');
+  try{const settings=db.prepare('SELECT demo_mode FROM settings WHERE id=1').get();let budget=before;if(!settings.demo_mode){if(process.env.WB_LIVE_RESUME!=='true')throw new Error('Боевое автовключение выключено в .env');const token=tokenForEntity(c.legal_entity_id),answer=await wb(`/adv/v1/budget?id=${c.campaign_id}`,token);budget=Number(answer.total||0);if(budget<=0)throw new Error('Кампания не включена: на бюджете нет средств');await wbCommand(`/adv/v0/start?id=${c.campaign_id}`,token);}db.prepare(`UPDATE campaigns SET status='active',schedule_paused=0,budget=?,updated_at=? WHERE id=?`).run(budget,now(),c.campaign_id);logAction(c,'schedule_resume','resumed','Включено после окончания паузы по расписанию МСК',0,before,budget,key);return'resumed'}catch(error){logAction(c,'schedule_resume','error',error.message,0,before,before,key);return'skipped'}
 }
 
 async function depositCampaign(c,before,scheduleResume) {
@@ -443,6 +461,8 @@ function ensureDefaultLegalEntity(){
 function listLegalEntities(){return db.prepare('SELECT id,name,enabled,token_enc IS NOT NULL AS token_saved,created_at,updated_at FROM legal_entities ORDER BY id').all().map(x=>({...x,id:Number(x.id)}));}
 function activeEntityId(url){const requested=Number(url?.searchParams?.get('legal_entity_id'));if(requested&&db.prepare('SELECT id FROM legal_entities WHERE id=?').get(requested))return requested;return Number(db.prepare('SELECT active_entity_id FROM settings WHERE id=1').get()?.active_entity_id)||1;}
 function tokenForEntity(id){const entity=db.prepare('SELECT token_enc FROM legal_entities WHERE id=? AND enabled=1').get(Number(id)||1);return decrypt(entity?.token_enc);}
+function normalizeScheduleWindows(value){let rows=value;if(typeof rows==='string')try{rows=JSON.parse(rows)}catch{rows=[]}if(!Array.isArray(rows))return[];return rows.slice(0,12).map(row=>({from:validTime(row?.from,'00:00'),to:validTime(row?.to,'00:00')})).filter(row=>row.from!==row.to)}
+function isInsideSchedule(value,date=new Date()){const windows=normalizeScheduleWindows(value),parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(date),hour=Number(parts.find(x=>x.type==='hour')?.value||0),minute=Number(parts.find(x=>x.type==='minute')?.value||0),nowMinutes=hour*60+minute,toMinutes=time=>Number(time.slice(0,2))*60+Number(time.slice(3));return windows.some(window=>{const from=toMinutes(window.from),to=toMinutes(window.to);return from<to?nowMinutes>=from&&nowMinutes<to:nowMinutes>=from||nowMinutes<to})}
 function validTime(value,fallback){return typeof value==='string'&&/^([01]\d|2[0-3]):[0-5]\d$/.test(value)?value:fallback;}
 function ymdMoscow(date){return new Intl.DateTimeFormat('en-CA',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit',day:'2-digit'}).format(date);}
 function moscowTimestamp(date=new Date()){const parts=new Intl.DateTimeFormat('sv-SE',{timeZone:'Europe/Moscow',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(date);return parts.replace('T',' ')}
@@ -460,6 +480,11 @@ function now(){return new Date().toISOString()} function positive(v){v=Number(v)
 function send(res,status,data){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data))} async function jsonBody(req){let s='';for await(const c of req){s+=c;if(s.length>1e6)throw new Error('Слишком большой запрос')}return s?JSON.parse(s):{}}
 
 server.listen(PORT,HOST,()=>console.log(`WB AutoFund: http://${HOST}:${PORT}`));
+let scheduleRunning=false;setInterval(async()=>{
+  if(scheduleRunning)return;scheduleRunning=true;
+  try{const rows=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' AND (r.schedule_enabled=1 OR c.schedule_paused=1)`).all();for(const c of rows){const inside=Boolean(c.schedule_enabled)&&isInsideSchedule(c.schedule_windows);if(inside&&c.status==='active')await pauseCampaignBySchedule(c,Number(c.budget));else if(!inside&&c.schedule_paused&&c.schedule_auto_resume)await resumeCampaignBySchedule(c,Number(c.budget));}}
+  catch(error){console.error('Schedule cycle failed:',error)}finally{scheduleRunning=false}
+},30000).unref();
 let pendingResumeRunning=false;setInterval(async()=>{
   if(pendingResumeRunning)return;pendingResumeRunning=true;
   try{const rows=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE r.auto_resume=1 AND c.status<>'active' AND c.status<>'archived' AND c.resume_after_at IS NOT NULL AND c.resume_after_at<=?`).all(now());for(const row of rows)await resumeCampaign(row,Number(row.budget));}
