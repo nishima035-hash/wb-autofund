@@ -66,9 +66,14 @@ async function api(req,res,url) {
   const body = ['POST','PUT','PATCH'].includes(req.method) ? await jsonBody(req) : {};
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
     const campaigns=db.prepare(`SELECT c.*,r.enabled,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' ORDER BY c.id`).all();
+    const periodFrom=url.searchParams.get('from'),periodTo=url.searchParams.get('to');
+    if(/^\d{4}-\d{2}-\d{2}$/.test(periodFrom||'')&&/^\d{4}-\d{2}-\d{2}$/.test(periodTo||'')&&periodFrom<=periodTo){
+      const periodRows=db.prepare(`SELECT campaign_id,SUM(views) views,SUM(clicks) clicks,SUM(orders) orders,SUM(spend) spend,SUM(revenue) revenue,COUNT(*) days FROM campaign_daily_stats WHERE stat_date BETWEEN ? AND ? GROUP BY campaign_id`).all(periodFrom,periodTo),byCampaign=new Map(periodRows.map(row=>[Number(row.campaign_id),row]));
+      for(const campaign of campaigns){const metrics=byCampaign.get(Number(campaign.id));if(!metrics){campaign.metrics_available=0;continue}campaign.views=Number(metrics.views||0);campaign.orders=Number(metrics.orders||0);campaign.spend=Number(metrics.spend||0);campaign.revenue=Number(metrics.revenue||0);campaign.ctr=metrics.views?Number(metrics.clicks||0)*100/Number(metrics.views):0;campaign.drr=metrics.revenue?campaign.spend*100/campaign.revenue:(campaign.spend>0?999999:0);campaign.metrics_available=1;campaign.metrics_from=periodFrom;campaign.metrics_to=periodTo;}
+    }
     const operations=db.prepare(`SELECT * FROM operations ORDER BY id DESC LIMIT 100`).all();
     const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,auto_sync_enabled,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
-    return send(res,200,{campaigns,operations,settings:{...s,live_deposits:process.env.WB_LIVE_DEPOSITS==='true'}});
+    return send(res,200,{campaigns,operations,settings:{...s,display_from:periodFrom||null,display_to:periodTo||null,live_deposits:process.env.WB_LIVE_DEPOSITS==='true'}});
   }
   if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataV2(url.searchParams.get('campaign_id'),url.searchParams.get('week')));
   if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsDataV2(url.searchParams.get('from'),url.searchParams.get('to'),url.searchParams.get('campaign_id')));
@@ -202,8 +207,12 @@ function wbStatMetrics(source){
 }
 
 async function syncStatistics(token, ids, days) {
-  const end=new Date(),begin=new Date(end); begin.setUTCDate(begin.getUTCDate()-Math.max(0,Number(days)-1));
-  const beginDate=ymdMoscow(begin),endDate=ymdMoscow(end);
+  const end=new Date(),begin=new Date(end),decisionBegin=new Date(end),decisionDays=Math.max(1,Math.min(31,Number(days)||7));
+  // One WB request costs the same rate-limit slot for one or 31 days. Keep the
+  // complete allowed history so the extension can mirror the period selected
+  // in the WB interface without making another request.
+  begin.setUTCDate(begin.getUTCDate()-30);decisionBegin.setUTCDate(decisionBegin.getUTCDate()-(decisionDays-1));
+  const beginDate=ymdMoscow(begin),decisionBeginDate=ymdMoscow(decisionBegin),endDate=ymdMoscow(end);
   db.prepare(`UPDATE campaigns SET metrics_available=0 WHERE source='wb'`).run();
   for (let offset=0;offset<ids.length;offset+=50) {
     const batch=ids.slice(offset,offset+50);
@@ -216,12 +225,13 @@ async function syncStatistics(token, ids, days) {
       // WB can return stale/zero totals at campaign level while the actual
       // values are present in days/apps. Build campaign totals from the daily
       // rows, which also makes the selected statistics period unambiguous.
-      const period=days.length?days.map(wbStatMetrics).reduce(sumStatMetrics,emptyStatMetrics()):wbStatMetrics(item);
+      const decisionPeriod=days.filter(day=>String(day.date||'').slice(0,10)>=decisionBeginDate);
+      const period=decisionPeriod.length?decisionPeriod.map(wbStatMetrics).reduce(sumStatMetrics,emptyStatMetrics()):wbStatMetrics(item);
       const spend=period.spend,revenue=period.revenue,views=period.views,orders=period.orders;
       const ctr=views?period.clicks/views*100:0;
       // Spend without attributed orders must never look like an excellent 0% DRR.
       const drr=revenue>0?spend/revenue*100:(spend>0?999999:0);
-      db.prepare(`UPDATE campaigns SET ctr=?,drr=?,spend=?,revenue=?,views=?,orders=?,metrics_available=1,metrics_from=?,metrics_to=?,updated_at=? WHERE id=?`).run(ctr,drr,spend,revenue,views,orders,beginDate,endDate,now(),id);
+      db.prepare(`UPDATE campaigns SET ctr=?,drr=?,spend=?,revenue=?,views=?,orders=?,metrics_available=1,metrics_from=?,metrics_to=?,updated_at=? WHERE id=?`).run(ctr,drr,spend,revenue,views,orders,decisionBeginDate,endDate,now(),id);
       for(const day of days){
         const statDate=String(day.date||'').slice(0,10);if(!statDate)continue;
         const dayMetrics=wbStatMetrics(day),daySpend=dayMetrics.spend,dayRevenue=dayMetrics.revenue,dayViews=dayMetrics.views,dayClicks=dayMetrics.clicks,dayOrders=dayMetrics.orders;

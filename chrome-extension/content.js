@@ -7,12 +7,18 @@
   const toggle=()=>{panel.classList.toggle('open');if(panel.classList.contains('open'))load()};
   btn.onclick=toggle;panel.querySelector('#wba-close').onclick=toggle;
   chrome.runtime.onMessage.addListener(m=>m.type==='toggle'&&toggle());
+  function selectedWbPeriod(){
+    const text=document.body?.innerText||'',match=text.match(/(\d{2})\.(\d{2})\.(\d{4})\s*(?:→|—|–|-)\s*(\d{2})\.(\d{2})\.(\d{4})/);
+    if(!match)return null;
+    return{from:`${match[3]}-${match[2]}-${match[1]}`,to:`${match[6]}-${match[5]}-${match[4]}`};
+  }
   async function load(){
     const body=panel.querySelector('#wba-body');body.className='wba-message';body.textContent='Загрузка…';
-    const r=await chrome.runtime.sendMessage({type:'api',path:'/api/dashboard'});
+    const selectedPeriod=selectedWbPeriod(),query=selectedPeriod?`?from=${selectedPeriod.from}&to=${selectedPeriod.to}`:'';
+    const r=await chrome.runtime.sendMessage({type:'api',path:`/api/dashboard${query}`});
     if(!r?.ok){body.textContent=r?.error||'Настройте подключение через значок расширения';return}
     body.className='';body.innerHTML='<div class="wba-search"><input type="search" placeholder="Поиск по названию или ID"><select><option value="all">Все кампании</option><option value="enabled">Автопополнение включено</option><option value="setup">Нужно настроить</option></select><small></small></div><div class="wba-cards"></div>';
-    const period=document.createElement('div');period.className='wba-meta';period.textContent=`Статистика: последние ${r.data.settings.stats_days||7} дней по МСК, включая сегодня`;body.prepend(period);
+    const period=document.createElement('div');period.className='wba-meta';period.textContent=selectedPeriod?`Статистика за период WB: ${selectedPeriod.from.split('-').reverse().join('.')} — ${selectedPeriod.to.split('-').reverse().join('.')}`:`Статистика: последние ${r.data.settings.stats_days||7} дней по МСК, включая сегодня`;body.prepend(period);
     const input=body.querySelector('input'),filter=body.querySelector('select'),cards=body.querySelector('.wba-cards'),count=body.querySelector('.wba-search small');
     const render=()=>{const q=input.value.trim().toLocaleLowerCase('ru'),items=r.data.campaigns.filter(c=>(!q||String(c.id).includes(q)||String(c.name).toLocaleLowerCase('ru').includes(q))&&(filter.value==='all'||(filter.value==='enabled'&&c.enabled)||(filter.value==='setup'&&!c.enabled)));count.textContent=`Найдено: ${items.length}`;cards.innerHTML=items.length?items.map(cardHtml).join(''):'<div class="wba-empty">Кампании не найдены</div>';bind(cards)};
     input.oninput=render;filter.onchange=render;render();input.focus();
