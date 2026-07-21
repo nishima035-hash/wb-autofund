@@ -96,7 +96,10 @@ async function api(req,res,url) {
     const id=Number(ruleMatch[1]);
     const currentRule=db.prepare('SELECT metrics_days,auto_resume,resume_daily_limit,resume_delay_seconds FROM rules WHERE campaign_id=?').get(id);
     db.prepare(`INSERT INTO rules(campaign_id,enabled,auto_resume,resume_daily_limit,resume_delay_seconds,use_max_drr,max_drr,use_min_ctr,min_ctr,use_min_views,min_views,use_min_orders,min_orders,metrics_days,use_time_window,time_from,time_to,min_budget,deposit_amount,daily_limit,funding_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id) DO UPDATE SET enabled=excluded.enabled,auto_resume=excluded.auto_resume,resume_daily_limit=excluded.resume_daily_limit,resume_delay_seconds=excluded.resume_delay_seconds,use_max_drr=excluded.use_max_drr,max_drr=excluded.max_drr,use_min_ctr=excluded.use_min_ctr,min_ctr=excluded.min_ctr,use_min_views=excluded.use_min_views,min_views=excluded.min_views,use_min_orders=excluded.use_min_orders,min_orders=excluded.min_orders,metrics_days=excluded.metrics_days,use_time_window=excluded.use_time_window,time_from=excluded.time_from,time_to=excluded.time_to,min_budget=excluded.min_budget,deposit_amount=excluded.deposit_amount,daily_limit=excluded.daily_limit,funding_type=excluded.funding_type,updated_at=excluded.updated_at`).run(id,body.enabled?1:0,body.auto_resume==null?Number(currentRule?.auto_resume||0):(body.auto_resume?1:0),clamp(body.resume_daily_limit??currentRule?.resume_daily_limit??1,1,24),clamp(body.resume_delay_seconds??currentRule?.resume_delay_seconds??15,5,300),body.use_max_drr!==false?1:0,positive(body.max_drr),body.use_min_ctr!==false?1:0,positive(body.min_ctr),body.use_min_views?1:0,Math.round(positive(body.min_views)),body.use_min_orders?1:0,Math.round(positive(body.min_orders)),clamp(body.metrics_days??currentRule?.metrics_days??7,1,31),body.use_time_window?1:0,validTime(body.time_from,'00:00'),validTime(body.time_to,'23:59'),positive(body.min_budget),Math.round(positive(body.deposit_amount)),clamp(body.daily_limit,1,100),[0,1,3].includes(Number(body.funding_type))?Number(body.funding_type):1,now());
-    return send(res,200,{ok:true});
+    setTimeout(()=>evaluateCampaign(id).catch(error=>console.error(`Immediate evaluation ${id} failed:`,error)),100);
+    const settings=db.prepare('SELECT demo_mode FROM settings WHERE id=1').get();
+    const liveDepositReady=Boolean(settings.demo_mode)||process.env.WB_LIVE_DEPOSITS==='true';
+    return send(res,200,{ok:true,evaluation_queued:true,live_deposit_ready:liveDepositReady,live_resume_ready:Boolean(settings.demo_mode)||process.env.WB_LIVE_RESUME==='true'});
   }
   if (req.method==='POST' && url.pathname==='/api/sync') {
     const alreadyRunning=Boolean(activeSync);
@@ -112,6 +115,11 @@ async function evaluateAll() {
   let deposited=0,resumed=0,skipped=0;
   for (const c of rows) { const result=await evaluate(c); result==='deposited'?deposited++:result==='resumed'?resumed++:skipped++; }
   return {checked:rows.length,deposited,resumed,skipped};
+}
+
+async function evaluateCampaign(campaignId) {
+  const row=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE c.id=? AND (r.enabled=1 OR r.auto_resume=1)`).get(campaignId);
+  return row?evaluate(row):'skipped';
 }
 
 async function evaluate(c) {
