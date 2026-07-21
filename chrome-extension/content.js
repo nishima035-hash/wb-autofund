@@ -8,8 +8,9 @@
   let displayDays=7,selectedEntityId=0,loadedCampaigns=[];chrome.storage.local.get({displayDays:7,selectedEntityId:0},value=>{displayDays=Number(value.displayDays)||7;selectedEntityId=Number(value.selectedEntityId)||0});
   const toggle=()=>{panel.classList.toggle('open');if(panel.classList.contains('open'))load()};
   btn.onclick=toggle;panel.querySelector('#wba-close').onclick=toggle;
-  chrome.runtime.onMessage.addListener(message=>{if(message.type==='toggle')toggle();if(message.type==='refresh'&&panel.classList.contains('open'))load()});
-  setInterval(()=>{if(panel.classList.contains('open'))load()},60000);
+  const refreshIfIdle=()=>{if(panel.classList.contains('open')&&!panel.querySelector('.wba-form.open'))load()};
+  chrome.runtime.onMessage.addListener(message=>{if(message.type==='toggle')toggle();if(message.type==='refresh')refreshIfIdle()});
+  setInterval(refreshIfIdle,60000);
   function selectedWbPeriod(){
     const text=document.body?.innerText||'',match=text.match(/(\d{2})\.(\d{2})\.(\d{4})\s*(?:→|—|–|-)\s*(\d{2})\.(\d{2})\.(\d{4})/);
     if(!match)return null;
