@@ -47,6 +47,15 @@ migrateColumn('rules','auto_resume','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','resume_daily_limit','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('rules','resume_delay_seconds','INTEGER NOT NULL DEFAULT 15');
 migrateColumn('campaigns','resume_after_at','TEXT');
+migrateColumn('rules','auto_pause','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','pause_use_max_drr','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','pause_max_drr','REAL NOT NULL DEFAULT 100');
+migrateColumn('rules','pause_use_min_ctr','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','pause_min_ctr','REAL NOT NULL DEFAULT 0');
+migrateColumn('rules','pause_use_min_views','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','pause_min_views','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','pause_use_min_orders','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','pause_min_orders','INTEGER NOT NULL DEFAULT 0');
 seedDemo();
 // A large Diary archive can contain hundreds of thousands of rows. Importing it
 // synchronously before listen() makes Docker health checks fail with a 502.
@@ -70,7 +79,7 @@ async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{status:'ok',database:'sqlite',time:now()});
   const body = ['POST','PUT','PATCH'].includes(req.method) ? await jsonBody(req) : {};
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
-    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.auto_resume,r.resume_daily_limit,r.resume_delay_seconds,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.metrics_days,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' ORDER BY c.id`).all();
+    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.auto_resume,r.resume_daily_limit,r.resume_delay_seconds,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.metrics_days,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type,r.auto_pause,r.pause_use_max_drr,r.pause_max_drr,r.pause_use_min_ctr,r.pause_min_ctr,r.pause_use_min_views,r.pause_min_views,r.pause_use_min_orders,r.pause_min_orders FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' ORDER BY c.id`).all();
     let periodFrom=url.searchParams.get('from'),periodTo=url.searchParams.get('to');
     const requestedDays=Number(url.searchParams.get('days'));
     if(Number.isFinite(requestedDays)&&requestedDays>=1&&requestedDays<=31){const range=moscowDateRange(requestedDays);periodFrom=range.from;periodTo=range.to;}
@@ -96,10 +105,11 @@ async function api(req,res,url) {
     const id=Number(ruleMatch[1]);
     const currentRule=db.prepare('SELECT metrics_days,auto_resume,resume_daily_limit,resume_delay_seconds FROM rules WHERE campaign_id=?').get(id);
     db.prepare(`INSERT INTO rules(campaign_id,enabled,auto_resume,resume_daily_limit,resume_delay_seconds,use_max_drr,max_drr,use_min_ctr,min_ctr,use_min_views,min_views,use_min_orders,min_orders,metrics_days,use_time_window,time_from,time_to,min_budget,deposit_amount,daily_limit,funding_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id) DO UPDATE SET enabled=excluded.enabled,auto_resume=excluded.auto_resume,resume_daily_limit=excluded.resume_daily_limit,resume_delay_seconds=excluded.resume_delay_seconds,use_max_drr=excluded.use_max_drr,max_drr=excluded.max_drr,use_min_ctr=excluded.use_min_ctr,min_ctr=excluded.min_ctr,use_min_views=excluded.use_min_views,min_views=excluded.min_views,use_min_orders=excluded.use_min_orders,min_orders=excluded.min_orders,metrics_days=excluded.metrics_days,use_time_window=excluded.use_time_window,time_from=excluded.time_from,time_to=excluded.time_to,min_budget=excluded.min_budget,deposit_amount=excluded.deposit_amount,daily_limit=excluded.daily_limit,funding_type=excluded.funding_type,updated_at=excluded.updated_at`).run(id,body.enabled?1:0,body.auto_resume==null?Number(currentRule?.auto_resume||0):(body.auto_resume?1:0),clamp(body.resume_daily_limit??currentRule?.resume_daily_limit??1,1,24),clamp(body.resume_delay_seconds??currentRule?.resume_delay_seconds??15,5,300),body.use_max_drr!==false?1:0,positive(body.max_drr),body.use_min_ctr!==false?1:0,positive(body.min_ctr),body.use_min_views?1:0,Math.round(positive(body.min_views)),body.use_min_orders?1:0,Math.round(positive(body.min_orders)),clamp(body.metrics_days??currentRule?.metrics_days??7,1,31),body.use_time_window?1:0,validTime(body.time_from,'00:00'),validTime(body.time_to,'23:59'),positive(body.min_budget),Math.round(positive(body.deposit_amount)),clamp(body.daily_limit,1,100),[0,1,3].includes(Number(body.funding_type))?Number(body.funding_type):1,now());
+    db.prepare(`UPDATE rules SET auto_pause=?,pause_use_max_drr=?,pause_max_drr=?,pause_use_min_ctr=?,pause_min_ctr=?,pause_use_min_views=?,pause_min_views=?,pause_use_min_orders=?,pause_min_orders=? WHERE campaign_id=?`).run(body.auto_pause?1:0,body.pause_use_max_drr?1:0,positive(body.pause_max_drr),body.pause_use_min_ctr?1:0,positive(body.pause_min_ctr),body.pause_use_min_views?1:0,Math.round(positive(body.pause_min_views)),body.pause_use_min_orders?1:0,Math.round(positive(body.pause_min_orders)),id);
     setTimeout(()=>evaluateCampaign(id).catch(error=>console.error(`Immediate evaluation ${id} failed:`,error)),100);
     const settings=db.prepare('SELECT demo_mode FROM settings WHERE id=1').get();
     const liveDepositReady=Boolean(settings.demo_mode)||process.env.WB_LIVE_DEPOSITS==='true';
-    return send(res,200,{ok:true,evaluation_queued:true,live_deposit_ready:liveDepositReady,live_resume_ready:Boolean(settings.demo_mode)||process.env.WB_LIVE_RESUME==='true'});
+    return send(res,200,{ok:true,evaluation_queued:true,live_deposit_ready:liveDepositReady,live_resume_ready:Boolean(settings.demo_mode)||process.env.WB_LIVE_RESUME==='true',live_pause_ready:Boolean(settings.demo_mode)||process.env.WB_LIVE_PAUSE==='true'});
   }
   if (req.method==='POST' && url.pathname==='/api/sync') {
     const alreadyRunning=Boolean(activeSync);
@@ -111,14 +121,14 @@ async function api(req,res,url) {
 }
 
 async function evaluateAll() {
-  const rows=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE r.enabled=1 OR r.auto_resume=1`).all();
+  const rows=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE r.enabled=1 OR r.auto_resume=1 OR r.auto_pause=1`).all();
   let deposited=0,resumed=0,skipped=0;
   for (const c of rows) { const result=await evaluate(c); result==='deposited'?deposited++:result==='resumed'?resumed++:skipped++; }
   return {checked:rows.length,deposited,resumed,skipped};
 }
 
 async function evaluateCampaign(campaignId) {
-  const row=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE c.id=? AND (r.enabled=1 OR r.auto_resume=1)`).get(campaignId);
+  const row=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE c.id=? AND (r.enabled=1 OR r.auto_resume=1 OR r.auto_pause=1)`).get(campaignId);
   return row?evaluate(row):'skipped';
 }
 
@@ -126,6 +136,14 @@ async function evaluate(c) {
   const before=Number(c.budget),periodMetrics=campaignMetricsForDays(c.campaign_id,c.metrics_days||7);
   c.metrics_available=periodMetrics.available?1:0;c.ctr=periodMetrics.ctr;c.drr=periodMetrics.drr;c.views=periodMetrics.views;c.orders=periodMetrics.orders;
   const metrics={ctr:Number(c.ctr),drr:Number(c.drr)};
+  if (c.status==='active' && c.auto_pause) {
+    const stopConditions=[];
+    if (c.pause_use_max_drr && metrics.drr>=Number(c.pause_max_drr)) stopConditions.push(`ДРР ${metrics.drr.toFixed(2)}% ≥ ${Number(c.pause_max_drr)}%`);
+    if (c.pause_use_min_ctr && metrics.ctr<=Number(c.pause_min_ctr)) stopConditions.push(`CTR ${metrics.ctr.toFixed(2)}% ≤ ${Number(c.pause_min_ctr)}%`);
+    if (c.pause_use_min_views && Number(c.views)<=Number(c.pause_min_views)) stopConditions.push(`Показы ${Number(c.views)} ≤ ${Number(c.pause_min_views)}`);
+    if (c.pause_use_min_orders && Number(c.orders)<=Number(c.pause_min_orders)) stopConditions.push(`Заказы ${Number(c.orders)} ≤ ${Number(c.pause_min_orders)}`);
+    if (stopConditions.length && c.metrics_available) return pauseCampaign(c,before,stopConditions.join('; '));
+  }
   let reason='';
   if (c.use_time_window && !isMoscowTimeAllowed(c.time_from,c.time_to)) reason=`Вне разрешённого времени (${c.time_from}–${c.time_to} МСК)`;
   else if ((c.use_max_drr || c.use_min_ctr || c.use_min_views || c.use_min_orders) && !c.metrics_available) reason='Статистика кампании не получена — действие заблокировано';
@@ -149,6 +167,23 @@ async function evaluate(c) {
   if (!reason && today>=c.daily_limit) reason='Достигнут дневной лимит';
   if (reason) { log(c,'skipped',reason,0,before,before); return 'skipped'; }
   return depositCampaign(c,before,false);
+}
+
+async function pauseCampaign(c,before,reason) {
+  const pauseKey=createHash('sha256').update(`pause:${c.campaign_id}:${Date.now()}`).digest('hex');
+  try {
+    const settings=db.prepare('SELECT * FROM settings WHERE id=1').get();
+    if (!settings.demo_mode) {
+      if (process.env.WB_LIVE_PAUSE!=='true') throw new Error('Боевое автоотключение выключено в .env');
+      await wbCommand(`/adv/v0/pause?id=${c.campaign_id}`,decrypt(settings.token_enc));
+    }
+    db.prepare(`UPDATE campaigns SET status='paused',resume_after_at=NULL,updated_at=? WHERE id=?`).run(now(),c.campaign_id);
+    // A safety latch: an automatically paused campaign must not be funded or
+    // resumed again until the user explicitly edits and enables those options.
+    db.prepare(`UPDATE rules SET enabled=0,auto_resume=0,updated_at=? WHERE campaign_id=?`).run(now(),c.campaign_id);
+    logAction(c,'pause','paused',`${settings.demo_mode?'Демо-автоотключение':'Кампания поставлена на паузу через WB API'}: ${reason}`,0,before,before,pauseKey);
+    return 'paused';
+  } catch(e) { logAction(c,'pause','error',e.message,0,before,before,pauseKey);return 'skipped'; }
 }
 
 async function depositCampaign(c,before,scheduleResume) {
