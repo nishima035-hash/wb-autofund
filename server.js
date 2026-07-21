@@ -85,7 +85,11 @@ async function api(req,res,url) {
     db.prepare(`INSERT INTO rules(campaign_id,enabled,use_max_drr,max_drr,use_min_ctr,min_ctr,use_min_views,min_views,use_min_orders,min_orders,use_time_window,time_from,time_to,min_budget,deposit_amount,daily_limit,funding_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id) DO UPDATE SET enabled=excluded.enabled,use_max_drr=excluded.use_max_drr,max_drr=excluded.max_drr,use_min_ctr=excluded.use_min_ctr,min_ctr=excluded.min_ctr,use_min_views=excluded.use_min_views,min_views=excluded.min_views,use_min_orders=excluded.use_min_orders,min_orders=excluded.min_orders,use_time_window=excluded.use_time_window,time_from=excluded.time_from,time_to=excluded.time_to,min_budget=excluded.min_budget,deposit_amount=excluded.deposit_amount,daily_limit=excluded.daily_limit,funding_type=excluded.funding_type,updated_at=excluded.updated_at`).run(id,body.enabled?1:0,body.use_max_drr!==false?1:0,positive(body.max_drr),body.use_min_ctr!==false?1:0,positive(body.min_ctr),body.use_min_views?1:0,Math.round(positive(body.min_views)),body.use_min_orders?1:0,Math.round(positive(body.min_orders)),body.use_time_window?1:0,validTime(body.time_from,'00:00'),validTime(body.time_to,'23:59'),positive(body.min_budget),Math.round(positive(body.deposit_amount)),clamp(body.daily_limit,1,100),[0,1,3].includes(Number(body.funding_type))?Number(body.funding_type):1,now());
     return send(res,200,{ok:true});
   }
-  if (req.method==='POST' && url.pathname==='/api/sync') { await syncCampaigns(); return send(res,200,{ok:true}); }
+  if (req.method==='POST' && url.pathname==='/api/sync') {
+    const alreadyRunning=Boolean(activeSync);
+    if(!alreadyRunning) syncCampaigns().catch(error=>console.error('Manual WB sync failed:',error));
+    return send(res,202,{ok:true,started:!alreadyRunning,running:true});
+  }
   if (req.method==='POST' && url.pathname==='/api/run') { const result=await evaluateAll(); return send(res,200,result); }
   return send(res,404,{error:'Метод не найден'});
 }
