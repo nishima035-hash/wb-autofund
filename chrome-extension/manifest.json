@@ -1,1 +1,19 @@
-{"manifest_version":3,"name":"WB AutoFund","version":"2.4.0","description":"Автопополнение и безопасное отложенное автовозобновление рекламных кампаний Wildberries.","permissions":["storage","tabs"],"host_permissions":["http://5.35.82.229/*"],"background":{"service_worker":"background.js"},"content_scripts":[{"matches":["https://*.wildberries.ru/*"],"js":["content.js"],"css":["content.css","search.css"],"run_at":"document_idle"}],"action":{"default_title":"WB AutoFund","default_popup":"popup.html"}}
+{
+  "manifest_version": 3,
+  "name": "WB AutoFund",
+  "version": "2.5.0",
+  "description": "Автопополнение и безопасное управление рекламными кампаниями Wildberries.",
+  "permissions": ["storage", "tabs"],
+  "host_permissions": ["http://5.35.82.229/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{
+    "matches": ["https://cmp.wildberries.ru/*"],
+    "js": ["content.js"],
+    "css": ["content.css", "search.css"],
+    "run_at": "document_idle"
+  }],
+  "action": {
+    "default_title": "WB AutoFund",
+    "default_popup": "popup.html"
+  }
+}

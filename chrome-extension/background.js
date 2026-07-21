@@ -2,7 +2,7 @@ const DEFAULT_URL='http://5.35.82.229';
 
 chrome.runtime.onMessage.addListener((message,sender,reply)=>{
   if(message.type==='broadcast-refresh'){
-    chrome.tabs.query({url:['https://*.wildberries.ru/*']},tabs=>{
+    chrome.tabs.query({url:['https://cmp.wildberries.ru/*']},tabs=>{
       for(const tab of tabs) chrome.tabs.sendMessage(tab.id,{type:'refresh'}).catch(()=>{});
     });
     reply({ok:true});
