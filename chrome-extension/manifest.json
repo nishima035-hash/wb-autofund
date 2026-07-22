@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "WB AutoFund",
-  "version": "2.8.1",
+  "version": "2.9.0",
   "description": "Автопополнение и безопасное управление рекламными кампаниями Wildberries.",
   "permissions": ["storage", "tabs"],
   "host_permissions": ["http://5.35.82.229/*"],
