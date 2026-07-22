@@ -54,10 +54,29 @@ function renderLegalEntities(){
   if($('#settingsEntity')){$('#settingsEntity').innerHTML=options;$('#settingsEntity').value=String(active)}
   if($('#entityList'))$('#entityList').innerHTML=entities.map(e=>`<div class="entity-row"><div><b>${esc(e.name)}</b><small>${e.token_saved?'Токен сохранён':'Токен не задан'}</small></div><button type="button" data-entity="${e.id}" ${e.id===active?'disabled':''}>${e.id===active?'Выбрано':'Выбрать'}</button></div>`).join('');
   document.querySelectorAll('[data-entity]').forEach(button=>button.onclick=()=>selectLegalEntity(Number(button.dataset.entity)));
+  renderEntityTabs();
 }
-async function selectLegalEntity(id){await request('/api/legal-entities/select',{method:'POST',body:JSON.stringify({id})});await load();toast('Юрлицо выбрано')}
+function renderEntityTabs(){
+  let tabs=$('#entityTabs');
+  if(!tabs){tabs=document.createElement('nav');tabs.id='entityTabs';tabs.className='entity-tabs';document.querySelector('main')?.prepend(tabs)}
+  const entities=state.entities||[],active=Number(state.active_entity_id||entities[0]?.id||1);
+  tabs.innerHTML=entities.map(entity=>`<button type="button" class="entity-tab ${entity.id===active?'active':''}" data-site-entity="${entity.id}"><span>${esc(entity.name)}</span>${entity.token_saved?'':'<small>Нет токена</small>'}</button>`).join('');
+  tabs.querySelectorAll('[data-site-entity]').forEach(button=>button.onclick=()=>selectLegalEntity(Number(button.dataset.siteEntity)));
+}
+async function refreshCurrentEntityView(){
+  const current=document.querySelector('.side.active')?.dataset.page;
+  if(current==='hourlyPage')await loadHourlyV2();
+  if(current==='analyticsPage')await loadAnalyticsV2();
+}
+async function selectLegalEntity(id){if(id===Number(state.active_entity_id))return;await request('/api/legal-entities/select',{method:'POST',body:JSON.stringify({id})});await load();await refreshCurrentEntityView();toast('Юрлицо выбрано')}
 const loadForEntities=load;load=async()=>{state=await request('/api/dashboard');viewTabs[1]?.classList.contains('active')?renderRulesList():render();renderLegalEntities()};
 if($('#settingsEntity'))$('#settingsEntity').onchange=event=>selectLegalEntity(Number(event.target.value));
 if($('#addEntity'))$('#addEntity').onclick=async()=>{try{await request('/api/legal-entities',{method:'POST',body:JSON.stringify({name:$('#newEntityName').value,token:$('#newEntityToken').value})});$('#newEntityName').value='';$('#newEntityToken').value='';await load();toast('Юрлицо добавлено')}catch(error){toast(error.message)}};
 if($('#saveSettings'))$('#saveSettings').onclick=()=>act('/api/settings',{method:'POST',body:JSON.stringify({legal_entity_id:Number($('#settingsEntity').value),token:$('#token').value,demo_mode:$('#demo').checked,auto_sync_enabled:$('#autoSync').checked,check_minutes:$('#interval').value,stats_days:$('#statsDays').value})},'Настройки сохранены');
+function addApiScopeBadges(input){
+  const label=input?.closest('label');if(!label||label.querySelector('.api-scope-row'))return;
+  const row=document.createElement('div');row.className='api-scope-row';row.innerHTML='<span>Используемый раздел токена</span><b>Продвижение</b>';
+  input.before(row);
+}
+addApiScopeBadges($('#newEntityToken'));addApiScopeBadges($('#token'));
 load();
