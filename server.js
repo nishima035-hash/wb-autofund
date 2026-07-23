@@ -38,6 +38,7 @@ migrateColumn('settings','active_entity_id','INTEGER');
 migrateColumn('campaigns','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('operations','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('hourly_snapshots','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
+migrateColumn('hourly_snapshots','orders_total','INTEGER');
 migrateColumn('campaign_daily_stats','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('sync_history','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('campaign_bids','legal_entity_id','INTEGER NOT NULL DEFAULT 1');
@@ -128,7 +129,7 @@ async function api(req,res,url) {
     const entities=listLegalEntities(),entity=entities.find(x=>x.id===entityId);
     return send(res,200,{campaigns,operations,activity_operations:activityOperations,entities,active_entity_id:entityId,settings:{...s,token_saved:entity?.token_saved||0,display_from:periodFrom||null,display_to:periodTo||null,live_deposits:process.env.WB_LIVE_DEPOSITS==='true',live_resume:process.env.WB_LIVE_RESUME==='true'}});
   }
-  if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataV2(url.searchParams.get('campaign_id'),url.searchParams.get('week'),activeEntityId(url)));
+    if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataWithOrders(url.searchParams.get('campaign_id'),url.searchParams.get('week'),activeEntityId(url)));
   if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsDataV2(url.searchParams.get('from'),url.searchParams.get('to'),url.searchParams.get('campaign_id'),activeEntityId(url)));
   if (req.method==='GET' && url.pathname==='/api/shared/export') return send(res,200,sharedExport(url.searchParams.get('from'),url.searchParams.get('to')));
   if (req.method==='POST' && url.pathname==='/api/settings') {
@@ -386,7 +387,7 @@ async function syncStatistics(token, ids, days,entityId=1) {
         db.prepare(`INSERT INTO campaign_daily_stats(campaign_id,stat_date,views,clicks,orders,spend,revenue,ctr,drr,updated_at,legal_entity_id) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id,stat_date) DO UPDATE SET views=excluded.views,clicks=excluded.clicks,orders=excluded.orders,spend=excluded.spend,revenue=excluded.revenue,ctr=excluded.ctr,drr=excluded.drr,updated_at=excluded.updated_at,legal_entity_id=excluded.legal_entity_id`).run(id,statDate,dayViews,dayClicks,dayOrders,daySpend,dayRevenue,dayCtr,dayDrr,now(),entityId);
       }
       const today=days.find(day=>String(day.date||'').slice(0,10)===endDate);
-      if(today){const campaign=db.prepare('SELECT name,status FROM campaigns WHERE id=?').get(id)||{},todayMetrics=wbStatMetrics(today);db.prepare(`INSERT OR IGNORE INTO hourly_snapshots(campaign_id,campaign_name,status,snapshot_at,impressions_total,clicks_total,quality,note,legal_entity_id) VALUES(?,?,?,?,?,?,'ok','WB API',?)`).run(id,campaign.name||'',campaign.status||'',moscowTimestamp(),todayMetrics.views,todayMetrics.clicks,entityId);}
+      if(today){const campaign=db.prepare('SELECT name,status FROM campaigns WHERE id=?').get(id)||{},todayMetrics=wbStatMetrics(today);db.prepare(`INSERT OR IGNORE INTO hourly_snapshots(campaign_id,campaign_name,status,snapshot_at,impressions_total,clicks_total,orders_total,quality,note,legal_entity_id) VALUES(?,?,?,?,?,?,?,'ok','WB API',?)`).run(id,campaign.name||'',campaign.status||'',moscowTimestamp(),todayMetrics.views,todayMetrics.clicks,todayMetrics.orders,entityId);}
     }
   }
 }
@@ -439,6 +440,38 @@ function hourlyDataV2(campaignId,week,entityId=1){
   rows.splice(0,rows.length,...latestByHour.values());
   let previous=null,previousDay='';
   for(const r of rows){const day=r.snapshot_at.slice(0,10),hour=Number(r.snapshot_at.slice(11,13));let views=null,clicks=null,uncertain=r.quality!=='ok',note=r.note||'';if(previous&&previousDay===day&&r.impressions_total!=null&&previous.impressions_total!=null){views=Math.max(0,r.impressions_total-previous.impressions_total);clicks=Math.max(0,r.clicks_total-previous.clicks_total)}else if(r.impressions_total!=null){views=r.impressions_total;clicks=r.clicks_total;uncertain=true;note=note||'Первый снимок дня'}cells.push({date:day,hour,views,clicks,uncertain,note});previous=r;previousDay=day}
+  return{campaigns,weeks,selected_id:id,week:start,cells};
+}
+function hourlyDataWithOrders(campaignId,week,entityId=1){
+  const campaigns=db.prepare(`SELECT c.id,c.name,c.status FROM campaigns c WHERE c.status<>'archived' AND c.legal_entity_id=? AND EXISTS(SELECT 1 FROM hourly_snapshots h WHERE h.campaign_id=c.id AND h.legal_entity_id=?) ORDER BY c.name`).all(entityId,entityId);
+  const id=Number(campaignId)||Number(campaigns[0]?.id||0);
+  const available=db.prepare(`SELECT DISTINCT substr(h.snapshot_at,1,10) day FROM hourly_snapshots h JOIN campaigns c ON c.id=h.campaign_id WHERE c.status<>'archived' AND h.legal_entity_id=? ORDER BY day DESC`).all(entityId).map(x=>mondayOf(x.day));
+  const weeks=[...new Set([weekMonday(),...available])].sort().reverse().map(value=>({value,label:weekLabel(value)}));
+  const start=/^\d{4}-\d{2}-\d{2}$/.test(week||'')?mondayOf(week):weeks[0]?.value||weekMonday();
+  const end=new Date(`${start}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+7);
+  const rows=db.prepare(`SELECT * FROM hourly_snapshots WHERE campaign_id=? AND legal_entity_id=? AND snapshot_at>=? AND snapshot_at<? ORDER BY snapshot_at`).all(id,entityId,`${start} 00:00:00`,`${end.toISOString().slice(0,10)} 00:00:00`);
+  const latestByHour=new Map();
+  for(const row of rows) latestByHour.set(row.snapshot_at.slice(0,13),row);
+  const cells=[],hourRows=[...latestByHour.values()];
+  let previous=null,previousDay='';
+  for(const row of hourRows){
+    const day=row.snapshot_at.slice(0,10),hour=Number(row.snapshot_at.slice(11,13));
+    let views=null,clicks=null,orders=null,uncertain=row.quality!=='ok',note=row.note||'';
+    if(previous&&previousDay===day&&row.impressions_total!=null&&previous.impressions_total!=null){
+      views=Math.max(0,row.impressions_total-previous.impressions_total);
+      clicks=Math.max(0,row.clicks_total-previous.clicks_total);
+      if(row.orders_total!=null&&previous.orders_total!=null) orders=Math.max(0,row.orders_total-previous.orders_total);
+    }else if(row.impressions_total!=null){
+      views=row.impressions_total;
+      clicks=row.clicks_total;
+      if(row.orders_total!=null) orders=row.orders_total;
+      uncertain=true;
+      note=note||'Первый снимок дня';
+    }
+    if(orders!=null) note=[note,'Заказы распределены по часу появления в API WB и могут уточняться позже'].filter(Boolean).join('. ');
+    cells.push({date:day,hour,views,clicks,orders,orders_uncertain:orders!=null,uncertain,note});
+    previous=row;previousDay=day;
+  }
   return{campaigns,weeks,selected_id:id,week:start,cells};
 }
 function analyticsDataV2(from,to,campaignId,entityId=1){
