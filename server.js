@@ -28,6 +28,9 @@ CREATE TABLE IF NOT EXISTS sync_history (id INTEGER PRIMARY KEY AUTOINCREMENT, s
 CREATE TABLE IF NOT EXISTS campaign_bids (campaign_id INTEGER NOT NULL, campaign_name TEXT, nm_id TEXT NOT NULL, subject TEXT, placement TEXT NOT NULL, bid_rub REAL, payment_type TEXT, updated_at TEXT, PRIMARY KEY(campaign_id,nm_id,placement));
 CREATE TABLE IF NOT EXISTS campaign_bid_history (snapshot_at TEXT NOT NULL, campaign_id INTEGER NOT NULL, campaign_name TEXT, nm_id TEXT NOT NULL, subject TEXT, placement TEXT NOT NULL, bid_rub REAL, payment_type TEXT, updated_at TEXT, PRIMARY KEY(snapshot_at,campaign_id,nm_id,placement));
 CREATE TABLE IF NOT EXISTS campaign_bid_changes (changed_at TEXT NOT NULL, campaign_id INTEGER NOT NULL, nm_id TEXT, placement TEXT, old_value TEXT, new_value TEXT, PRIMARY KEY(changed_at,campaign_id,nm_id,placement));
+CREATE TABLE IF NOT EXISTS supplier_orders (legal_entity_id INTEGER NOT NULL, srid TEXT NOT NULL, order_date TEXT NOT NULL, last_change_date TEXT, nm_id TEXT, supplier_article TEXT, total_price REAL, finished_price REAL, is_cancel INTEGER NOT NULL DEFAULT 0, cancel_date TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(legal_entity_id,srid));
+CREATE TABLE IF NOT EXISTS entity_sync_state (legal_entity_id INTEGER PRIMARY KEY, orders_last_change TEXT, orders_last_sync_at TEXT, orders_last_error TEXT);
+CREATE INDEX IF NOT EXISTS idx_supplier_orders_entity_date_nm ON supplier_orders(legal_entity_id,order_date,nm_id);
 INSERT OR IGNORE INTO settings(id,demo_mode,check_minutes,updated_at) VALUES(1,1,5,datetime('now'));`);
 migrateColumn('rules','use_max_drr','INTEGER NOT NULL DEFAULT 1');
 migrateColumn('rules','use_min_ctr','INTEGER NOT NULL DEFAULT 1');
@@ -319,7 +322,14 @@ async function doSyncCampaigns(entityId) {
     const name=a.name || a.settings?.name || `Кампания ${id}`;
     db.prepare(`INSERT INTO campaigns(id,name,status,budget,ctr,drr,source,updated_at,legal_entity_id) VALUES(?,?,?,0,0,0,'wb',?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,status=excluded.status,source='wb',updated_at=excluded.updated_at,legal_entity_id=excluded.legal_entity_id`).run(id,name,Number(a.status)===9?'active':'paused',now(),entityId);
   }
-  await syncCampaignBids(token,campaigns);
+  await syncCampaignBids(token,campaigns,entityId);
+  // The Statistics API contains the actual order timestamp. It is independent
+  // from Promotion API limits and must never block campaign automation.
+  try { await syncSupplierOrders(token,entityId); }
+  catch(error) {
+    console.warn(`WB supplier orders sync failed for entity ${entityId}:`,error.message);
+    db.prepare(`INSERT INTO entity_sync_state(legal_entity_id,orders_last_sync_at,orders_last_error) VALUES(?,?,?) ON CONFLICT(legal_entity_id) DO UPDATE SET orders_last_sync_at=excluded.orders_last_sync_at,orders_last_error=excluded.orders_last_error`).run(entityId,now(),String(error.message||error).slice(0,1000));
+  }
   // Statistics has the strictest WB limit, so request it before the per-campaign
   // budget calls consume the seller's shared promotion API allowance.
   await new Promise(resolve=>setTimeout(resolve,21000));
@@ -332,13 +342,46 @@ async function doSyncCampaigns(entityId) {
   }
 }
 
-async function syncCampaignBids(token,campaigns){
+async function syncCampaignBids(token,campaigns,entityId=1){
   const ids=campaigns.map(a=>Number(a.advertId||a.advert_id||a.id)).filter(Boolean),stamp=moscowTimestamp();let changed=0,seen=0;
   for(let offset=0;offset<ids.length;offset+=50){if(offset)await new Promise(resolve=>setTimeout(resolve,1100));const response=await wb(`/api/advert/v2/adverts?ids=${ids.slice(offset,offset+50).join(',')}`,token),items=Array.isArray(response)?response:(response?.adverts||response?.data||[]);
     for(const item of items){const id=Number(item.advertId||item.advert_id||item.id);if(!id)continue;const settings=item.settings&&typeof item.settings==='object'?item.settings:{},name=item.name||item.campaignName||item.advertName||settings.name||`Кампания ${id}`,payment=String(item.paymentType||item.payment_type||settings.payment_type||settings.paymentType||'').toUpperCase(),nms=Array.isArray(item.nm_settings)?item.nm_settings:(Array.isArray(settings.nm_settings)?settings.nm_settings:[]);
-      for(const nm of nms){const nmId=String(nm.nm_id||nm.nmId||nm.nm||'');if(!nmId)continue;const bids=nm.bids_kopecks&&typeof nm.bids_kopecks==='object'?nm.bids_kopecks:{},subject=typeof nm.subject==='object'?(nm.subject.name||nm.subject.id||''):(nm.subject||nm.subject_name||nm.name||'');for(const placement of ['search','recommendations']){const kopecks=Number(bids[placement]);if(!Number.isFinite(kopecks))continue;const rub=kopecks/100,old=db.prepare(`SELECT bid_rub FROM campaign_bids WHERE campaign_id=? AND nm_id=? AND placement=?`).get(id,nmId,placement);if(old&&Number(old.bid_rub)!==rub){db.prepare(`INSERT OR IGNORE INTO campaign_bid_changes(changed_at,campaign_id,nm_id,placement,old_value,new_value) VALUES(?,?,?,?,?,?)`).run(stamp,id,nmId,placement,String(old.bid_rub),String(rub));changed++}db.prepare(`INSERT INTO campaign_bids(campaign_id,campaign_name,nm_id,subject,placement,bid_rub,payment_type,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id,nm_id,placement) DO UPDATE SET campaign_name=excluded.campaign_name,subject=excluded.subject,bid_rub=excluded.bid_rub,payment_type=excluded.payment_type,updated_at=excluded.updated_at`).run(id,name,nmId,String(subject),placement,rub,payment,stamp);db.prepare(`INSERT OR IGNORE INTO campaign_bid_history(snapshot_at,campaign_id,campaign_name,nm_id,subject,placement,bid_rub,payment_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`).run(stamp,id,name,nmId,String(subject),placement,rub,payment,stamp);seen++}}}
+      for(const nm of nms){const nmId=String(nm.nm_id||nm.nmId||nm.nm||'');if(!nmId)continue;const bids=nm.bids_kopecks&&typeof nm.bids_kopecks==='object'?nm.bids_kopecks:{},subject=typeof nm.subject==='object'?(nm.subject.name||nm.subject.id||''):(nm.subject||nm.subject_name||nm.name||'');for(const placement of ['search','recommendations']){const kopecks=Number(bids[placement]);if(!Number.isFinite(kopecks))continue;const rub=kopecks/100,old=db.prepare(`SELECT bid_rub FROM campaign_bids WHERE campaign_id=? AND nm_id=? AND placement=? AND legal_entity_id=?`).get(id,nmId,placement,entityId);if(old&&Number(old.bid_rub)!==rub){db.prepare(`INSERT OR IGNORE INTO campaign_bid_changes(changed_at,campaign_id,nm_id,placement,old_value,new_value,legal_entity_id) VALUES(?,?,?,?,?,?,?)`).run(stamp,id,nmId,placement,String(old.bid_rub),String(rub),entityId);changed++}db.prepare(`INSERT INTO campaign_bids(campaign_id,campaign_name,nm_id,subject,placement,bid_rub,payment_type,updated_at,legal_entity_id) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id,nm_id,placement) DO UPDATE SET campaign_name=excluded.campaign_name,subject=excluded.subject,bid_rub=excluded.bid_rub,payment_type=excluded.payment_type,updated_at=excluded.updated_at,legal_entity_id=excluded.legal_entity_id`).run(id,name,nmId,String(subject),placement,rub,payment,stamp,entityId);db.prepare(`INSERT OR IGNORE INTO campaign_bid_history(snapshot_at,campaign_id,campaign_name,nm_id,subject,placement,bid_rub,payment_type,updated_at,legal_entity_id) VALUES(?,?,?,?,?,?,?,?,?,?)`).run(stamp,id,name,nmId,String(subject),placement,rub,payment,stamp,entityId);seen++}}}
   }
   console.log(`WB bids synced: ${seen}; changed: ${changed}`);return{seen,changed};
+}
+
+async function syncSupplierOrders(token,entityId=1,force=false){
+  const state=db.prepare(`SELECT * FROM entity_sync_state WHERE legal_entity_id=?`).get(entityId);
+  const lastSyncMs=Date.parse(state?.orders_last_sync_at||'');
+  if(!force&&Number.isFinite(lastSyncMs)&&Date.now()-lastSyncMs<25*60*1000)return{skipped:true};
+  const fallback=new Date(Date.now()-7*86400000).toISOString();
+  const cursor=state?.orders_last_change?new Date(`${state.orders_last_change.replace(' ','T')}+03:00`):null;
+  const dateFrom=cursor&&!Number.isNaN(cursor.getTime())?new Date(cursor.getTime()-2*3600000).toISOString():fallback;
+  const rows=await wbStatistics(`/api/v1/supplier/orders?dateFrom=${encodeURIComponent(dateFrom)}&flag=0`,token);
+  let maxChange=state?.orders_last_change||'';
+  const upsert=db.prepare(`INSERT INTO supplier_orders(legal_entity_id,srid,order_date,last_change_date,nm_id,supplier_article,total_price,finished_price,is_cancel,cancel_date,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(legal_entity_id,srid) DO UPDATE SET order_date=excluded.order_date,last_change_date=excluded.last_change_date,nm_id=excluded.nm_id,supplier_article=excluded.supplier_article,total_price=excluded.total_price,finished_price=excluded.finished_price,is_cancel=excluded.is_cancel,cancel_date=excluded.cancel_date,updated_at=excluded.updated_at`);
+  for(const row of Array.isArray(rows)?rows:[]){
+    const srid=String(row.srid||'').trim(),orderDate=normalizeMoscowDate(row.date),changed=normalizeMoscowDate(row.lastChangeDate);
+    if(!srid||!orderDate)continue;
+    upsert.run(entityId,srid,orderDate,changed||null,String(row.nmId||''),String(row.supplierArticle||''),numOrNull(row.totalPrice),numOrNull(row.finishedPrice),row.isCancel?1:0,normalizeMoscowDate(row.cancelDate)||null,now());
+    if(changed>maxChange)maxChange=changed;
+  }
+  db.prepare(`INSERT INTO entity_sync_state(legal_entity_id,orders_last_change,orders_last_sync_at,orders_last_error) VALUES(?,?,?,NULL) ON CONFLICT(legal_entity_id) DO UPDATE SET orders_last_change=excluded.orders_last_change,orders_last_sync_at=excluded.orders_last_sync_at,orders_last_error=NULL`).run(entityId,maxChange||null,now());
+  console.log(`WB supplier orders synced for entity ${entityId}: ${Array.isArray(rows)?rows.length:0}`);
+  return{rows:Array.isArray(rows)?rows.length:0};
+}
+
+async function wbStatistics(path,token){
+  const base=process.env.WB_STATISTICS_API_BASE||'https://statistics-api.wildberries.ru';
+  for(let attempt=0;attempt<3;attempt++){
+    const response=await fetch(`${base}${path}`,{headers:{Authorization:token}});
+    if(response.ok){const text=await response.text();return text?JSON.parse(text):[]}
+    const error=await response.text();
+    if(response.status!==429||attempt===2)throw new Error(`WB Statistics API: ${response.status} ${error}`);
+    const retryAfter=Number(response.headers.get('retry-after'));
+    await new Promise(resolve=>setTimeout(resolve,Number.isFinite(retryAfter)&&retryAfter>0?retryAfter*1000:60_000));
+  }
 }
 
 function emptyStatMetrics(){return{views:0,clicks:0,orders:0,spend:0,revenue:0}}
@@ -445,12 +488,17 @@ function hourlyDataV2(campaignId,week,entityId=1){
   return{campaigns,weeks,selected_id:id,week:start,cells};
 }
 function hourlyDataWithOrders(campaignId,week,entityId=1){
-  const campaigns=db.prepare(`SELECT c.id,c.name,c.status FROM campaigns c WHERE c.status<>'archived' AND c.legal_entity_id=? AND EXISTS(SELECT 1 FROM hourly_snapshots h WHERE h.campaign_id=c.id AND h.legal_entity_id=?) ORDER BY c.name`).all(entityId,entityId);
+  const campaigns=db.prepare(`SELECT c.id,c.name,c.status FROM campaigns c WHERE c.status<>'archived' AND c.legal_entity_id=? ORDER BY c.name`).all(entityId);
   const id=Number(campaignId)||Number(campaigns[0]?.id||0);
-  const available=db.prepare(`SELECT DISTINCT substr(h.snapshot_at,1,10) day FROM hourly_snapshots h JOIN campaigns c ON c.id=h.campaign_id WHERE c.status<>'archived' AND h.legal_entity_id=? ORDER BY day DESC`).all(entityId).map(x=>mondayOf(x.day));
+  const available=db.prepare(`SELECT day FROM (
+    SELECT DISTINCT substr(snapshot_at,1,10) day FROM hourly_snapshots WHERE legal_entity_id=?
+    UNION
+    SELECT DISTINCT substr(order_date,1,10) day FROM supplier_orders WHERE legal_entity_id=?
+  ) ORDER BY day DESC`).all(entityId,entityId).map(x=>mondayOf(x.day));
   const weeks=[...new Set([weekMonday(),...available])].sort().reverse().map(value=>({value,label:weekLabel(value)}));
   const start=/^\d{4}-\d{2}-\d{2}$/.test(week||'')?mondayOf(week):weeks[0]?.value||weekMonday();
   const end=new Date(`${start}T00:00:00Z`);end.setUTCDate(end.getUTCDate()+7);
+  const endDay=end.toISOString().slice(0,10);
   const rows=db.prepare(`SELECT * FROM hourly_snapshots WHERE campaign_id=? AND legal_entity_id=? AND snapshot_at>=? AND snapshot_at<? ORDER BY snapshot_at`).all(id,entityId,`${start} 00:00:00`,`${end.toISOString().slice(0,10)} 00:00:00`);
   const latestByHour=new Map();
   for(const row of rows) latestByHour.set(row.snapshot_at.slice(0,13),row);
@@ -460,9 +508,14 @@ function hourlyDataWithOrders(campaignId,week,entityId=1){
     const day=row.snapshot_at.slice(0,10),hour=Number(row.snapshot_at.slice(11,13));
     let views=null,clicks=null,orders=null,uncertain=row.quality!=='ok',note=row.note||'';
     if(previous&&previousDay===day&&row.impressions_total!=null&&previous.impressions_total!=null){
-      views=Math.max(0,row.impressions_total-previous.impressions_total);
-      clicks=Math.max(0,row.clicks_total-previous.clicks_total);
+      const viewsDelta=row.impressions_total-previous.impressions_total,clicksDelta=row.clicks_total-previous.clicks_total;
+      views=Math.max(0,viewsDelta);
+      clicks=Math.max(0,clicksDelta);
       if(row.orders_total!=null&&previous.orders_total!=null) orders=Math.max(0,row.orders_total-previous.orders_total);
+      const previousMs=Date.parse(previous.snapshot_at.replace(' ','T')+'+03:00'),currentMs=Date.parse(row.snapshot_at.replace(' ','T')+'+03:00');
+      const gapMinutes=Math.round((currentMs-previousMs)/60000);
+      if(viewsDelta<0||clicksDelta<0){uncertain=true;note=[note,'Счётчик WB был пересчитан или сброшен'].filter(Boolean).join('. ')}
+      if(gapMinutes>90){uncertain=true;note=[note,`Между снимками ${gapMinutes} мин.; показы и клики относятся ко всему этому интервалу`].filter(Boolean).join('. ')}
     }else if(row.impressions_total!=null){
       views=row.impressions_total;
       clicks=row.clicks_total;
@@ -470,11 +523,42 @@ function hourlyDataWithOrders(campaignId,week,entityId=1){
       uncertain=true;
       note=note||'Первый снимок дня';
     }
-    if(orders!=null) note=[note,'Заказы распределены по часу появления в API WB и могут уточняться позже'].filter(Boolean).join('. ');
-    cells.push({date:day,hour,views,clicks,orders,orders_uncertain:orders!=null,uncertain,note});
+    cells.push({date:day,hour,views,clicks,orders,orders_uncertain:orders!=null,uncertain,note,captured_at:row.snapshot_at});
     previous=row;previousDay=day;
   }
-  return{campaigns,weeks,selected_id:id,week:start,cells};
+  const cellMap=new Map(cells.map(cell=>[`${cell.date}-${cell.hour}`,cell]));
+  const nmRows=db.prepare(`SELECT DISTINCT nm_id FROM campaign_bids WHERE campaign_id=? AND legal_entity_id=? AND nm_id<>''`).all(id,entityId);
+  const nmIds=nmRows.map(row=>String(row.nm_id));
+  const syncState=db.prepare(`SELECT orders_last_sync_at,orders_last_error FROM entity_sync_state WHERE legal_entity_id=?`).get(entityId)||{};
+  let ordersMode='promotion_report_time',ambiguousProducts=0;
+  if(nmIds.length&&syncState.orders_last_sync_at&&!syncState.orders_last_error){
+    const placeholders=nmIds.map(()=>'?').join(',');
+    const orderRows=db.prepare(`SELECT substr(order_date,1,10) date,CAST(substr(order_date,12,2) AS INTEGER) hour,COUNT(*) orders
+      FROM supplier_orders WHERE legal_entity_id=? AND is_cancel=0 AND nm_id IN (${placeholders})
+      AND order_date>=? AND order_date<? GROUP BY substr(order_date,1,10),CAST(substr(order_date,12,2) AS INTEGER)`)
+      .all(entityId,...nmIds,`${start} 00:00:00`,`${endDay} 00:00:00`);
+    ambiguousProducts=db.prepare(`SELECT COUNT(*) count FROM (
+      SELECT nm_id FROM campaign_bids WHERE legal_entity_id=? AND nm_id IN (${placeholders})
+      GROUP BY nm_id HAVING COUNT(DISTINCT campaign_id)>1
+    )`).get(entityId,...nmIds).count||0;
+    for(const cell of cells){cell.orders=null;cell.orders_uncertain=false}
+    for(const order of orderRows){
+      const key=`${order.date}-${order.hour}`;
+      const cell=cellMap.get(key)||{date:order.date,hour:order.hour,views:null,clicks:null,uncertain:true,note:'Нет снимка рекламной статистики за этот час'};
+      cell.orders=Number(order.orders)||0;
+      cell.orders_uncertain=ambiguousProducts>0;
+      cell.note=[cell.note,'Заказы показаны по фактическому времени оформления',ambiguousProducts?'Привязка к кампании расчётная: один или несколько товаров участвуют в нескольких кампаниях':'Привязка к кампании рассчитана по товарам из кампании'].filter(Boolean).join('. ');
+      if(!cellMap.has(key)){cells.push(cell);cellMap.set(key,cell)}
+    }
+    ordersMode='statistics_actual_time';
+  }else{
+    for(const cell of cells)if(cell.orders!=null){
+      cell.orders_uncertain=true;
+      cell.note=[cell.note,'Заказы распределены по часу появления в рекламном отчёте WB и могут уточняться позже'].filter(Boolean).join('. ');
+    }
+  }
+  cells.sort((a,b)=>a.date.localeCompare(b.date)||a.hour-b.hour);
+  return{campaigns,weeks,selected_id:id,week:start,cells,orders_mode:ordersMode,orders_last_sync_at:syncState.orders_last_sync_at||null,orders_sync_error:syncState.orders_last_error||null,ambiguous_products:ambiguousProducts};
 }
 function analyticsDataV2(from,to,campaignId,entityId=1){
   const end=to&&/^\d{4}-\d{2}-\d{2}$/.test(to)?to:ymdMoscow(new Date()),start=from&&/^\d{4}-\d{2}-\d{2}$/.test(from)?from:(()=>{const d=new Date();d.setUTCDate(d.getUTCDate()-6);return ymdMoscow(d)})();
