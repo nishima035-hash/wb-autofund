@@ -72,6 +72,8 @@ migrateColumn('rules','pause_use_min_views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','pause_min_views','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','pause_use_min_orders','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','pause_min_orders','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','pause_use_max_daily_spend','INTEGER NOT NULL DEFAULT 0');
+migrateColumn('rules','pause_max_daily_spend','REAL NOT NULL DEFAULT 0');
 migrateColumn('rules','schedule_enabled','INTEGER NOT NULL DEFAULT 0');
 migrateColumn('rules','schedule_windows','TEXT NOT NULL DEFAULT \'[]\'');
 migrateColumn('rules','schedule_auto_resume','INTEGER NOT NULL DEFAULT 1');
@@ -120,7 +122,7 @@ async function api(req,res,url) {
   }
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
     const entityId=activeEntityId(url);
-    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.auto_resume,r.resume_daily_limit,r.resume_delay_seconds,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.metrics_days,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type,r.auto_pause,r.pause_use_max_drr,r.pause_max_drr,r.pause_use_min_ctr,r.pause_min_ctr,r.pause_use_min_views,r.pause_min_views,r.pause_use_min_orders,r.pause_min_orders,r.schedule_enabled,r.schedule_windows,r.schedule_auto_resume FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' AND c.legal_entity_id=? ORDER BY c.id`).all(entityId);
+    const campaigns=db.prepare(`SELECT c.*,r.enabled,r.auto_resume,r.resume_daily_limit,r.resume_delay_seconds,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.metrics_days,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type,r.auto_pause,r.pause_use_max_drr,r.pause_max_drr,r.pause_use_min_ctr,r.pause_min_ctr,r.pause_use_min_views,r.pause_min_views,r.pause_use_min_orders,r.pause_min_orders,r.pause_use_max_daily_spend,r.pause_max_daily_spend,r.schedule_enabled,r.schedule_windows,r.schedule_auto_resume FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' AND c.legal_entity_id=? ORDER BY c.id`).all(entityId);
     let periodFrom=url.searchParams.get('from'),periodTo=url.searchParams.get('to');
     const requestedDays=Number(url.searchParams.get('days'));
     if(Number.isFinite(requestedDays)&&requestedDays>=1&&requestedDays<=31){const range=moscowDateRange(requestedDays);periodFrom=range.from;periodTo=range.to;}
@@ -149,7 +151,7 @@ async function api(req,res,url) {
     const id=Number(ruleMatch[1]);
     const currentRule=db.prepare('SELECT metrics_days,auto_resume,resume_daily_limit,resume_delay_seconds FROM rules WHERE campaign_id=?').get(id);
     db.prepare(`INSERT INTO rules(campaign_id,enabled,auto_resume,resume_daily_limit,resume_delay_seconds,use_max_drr,max_drr,use_min_ctr,min_ctr,use_min_views,min_views,use_min_orders,min_orders,metrics_days,use_time_window,time_from,time_to,min_budget,deposit_amount,daily_limit,funding_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id) DO UPDATE SET enabled=excluded.enabled,auto_resume=excluded.auto_resume,resume_daily_limit=excluded.resume_daily_limit,resume_delay_seconds=excluded.resume_delay_seconds,use_max_drr=excluded.use_max_drr,max_drr=excluded.max_drr,use_min_ctr=excluded.use_min_ctr,min_ctr=excluded.min_ctr,use_min_views=excluded.use_min_views,min_views=excluded.min_views,use_min_orders=excluded.use_min_orders,min_orders=excluded.min_orders,metrics_days=excluded.metrics_days,use_time_window=excluded.use_time_window,time_from=excluded.time_from,time_to=excluded.time_to,min_budget=excluded.min_budget,deposit_amount=excluded.deposit_amount,daily_limit=excluded.daily_limit,funding_type=excluded.funding_type,updated_at=excluded.updated_at`).run(id,body.enabled?1:0,body.auto_resume==null?Number(currentRule?.auto_resume||0):(body.auto_resume?1:0),clamp(body.resume_daily_limit??currentRule?.resume_daily_limit??1,1,24),clamp(body.resume_delay_seconds??currentRule?.resume_delay_seconds??15,5,300),body.use_max_drr!==false?1:0,positive(body.max_drr),body.use_min_ctr!==false?1:0,positive(body.min_ctr),body.use_min_views?1:0,Math.round(positive(body.min_views)),body.use_min_orders?1:0,Math.round(positive(body.min_orders)),clamp(body.metrics_days??currentRule?.metrics_days??7,1,31),body.use_time_window?1:0,validTime(body.time_from,'00:00'),validTime(body.time_to,'23:59'),positive(body.min_budget),Math.round(positive(body.deposit_amount)),clamp(body.daily_limit,1,100),[0,1,3].includes(Number(body.funding_type))?Number(body.funding_type):1,now());
-    db.prepare(`UPDATE rules SET auto_pause=?,pause_use_max_drr=?,pause_max_drr=?,pause_use_min_ctr=?,pause_min_ctr=?,pause_use_min_views=?,pause_min_views=?,pause_use_min_orders=?,pause_min_orders=? WHERE campaign_id=?`).run(body.auto_pause?1:0,body.pause_use_max_drr?1:0,positive(body.pause_max_drr),body.pause_use_min_ctr?1:0,positive(body.pause_min_ctr),body.pause_use_min_views?1:0,Math.round(positive(body.pause_min_views)),body.pause_use_min_orders?1:0,Math.round(positive(body.pause_min_orders)),id);
+    db.prepare(`UPDATE rules SET auto_pause=?,pause_use_max_drr=?,pause_max_drr=?,pause_use_min_ctr=?,pause_min_ctr=?,pause_use_min_views=?,pause_min_views=?,pause_use_min_orders=?,pause_min_orders=?,pause_use_max_daily_spend=?,pause_max_daily_spend=? WHERE campaign_id=?`).run(body.auto_pause?1:0,body.pause_use_max_drr?1:0,positive(body.pause_max_drr),body.pause_use_min_ctr?1:0,positive(body.pause_min_ctr),body.pause_use_min_views?1:0,Math.round(positive(body.pause_min_views)),body.pause_use_min_orders?1:0,Math.round(positive(body.pause_min_orders)),body.pause_use_max_daily_spend?1:0,positive(body.pause_max_daily_spend),id);
     if(Object.hasOwn(body,'schedule_enabled')||Object.hasOwn(body,'schedule_windows')||Object.hasOwn(body,'schedule_auto_resume'))db.prepare(`UPDATE rules SET schedule_enabled=?,schedule_windows=?,schedule_auto_resume=? WHERE campaign_id=?`).run(body.schedule_enabled?1:0,JSON.stringify(normalizeScheduleWindows(body.schedule_windows)),body.schedule_auto_resume===false?0:1,id);
     setTimeout(()=>evaluateCampaign(id).catch(error=>console.error(`Immediate evaluation ${id} failed:`,error)),100);
     const settings=db.prepare('SELECT demo_mode FROM settings WHERE id=1').get();
@@ -187,11 +189,16 @@ async function evaluate(c) {
   const metrics={ctr:Number(c.ctr),drr:Number(c.drr)};
   if (c.status==='active' && c.auto_pause) {
     const stopConditions=[];
-    if (c.pause_use_max_drr && metrics.drr>Number(c.pause_max_drr)) stopConditions.push(`ДРР ${metrics.drr.toFixed(2)}% > ${Number(c.pause_max_drr)}%`);
-    if (c.pause_use_min_ctr && metrics.ctr<Number(c.pause_min_ctr)) stopConditions.push(`CTR ${metrics.ctr.toFixed(2)}% < ${Number(c.pause_min_ctr)}%`);
-    if (c.pause_use_min_views && Number(c.views)<Number(c.pause_min_views)) stopConditions.push(`Показы ${Number(c.views)} < ${Number(c.pause_min_views)}`);
-    if (c.pause_use_min_orders && Number(c.orders)<Number(c.pause_min_orders)) stopConditions.push(`Заказы ${Number(c.orders)} < ${Number(c.pause_min_orders)}`);
-    if (stopConditions.length && c.metrics_available) return pauseCampaign(c,before,stopConditions.join('; '));
+    if (c.metrics_available) {
+      if (c.pause_use_max_drr && metrics.drr>Number(c.pause_max_drr)) stopConditions.push(`ДРР ${metrics.drr.toFixed(2)}% > ${Number(c.pause_max_drr)}%`);
+      if (c.pause_use_min_ctr && metrics.ctr<Number(c.pause_min_ctr)) stopConditions.push(`CTR ${metrics.ctr.toFixed(2)}% < ${Number(c.pause_min_ctr)}%`);
+      if (c.pause_use_min_views && Number(c.views)<Number(c.pause_min_views)) stopConditions.push(`Показы ${Number(c.views)} < ${Number(c.pause_min_views)}`);
+      if (c.pause_use_min_orders && Number(c.orders)<Number(c.pause_min_orders)) stopConditions.push(`Заказы ${Number(c.orders)} < ${Number(c.pause_min_orders)}`);
+    }
+    const todaySpend=campaignSpendForMoscowToday(c.campaign_id,c.legal_entity_id);
+    const dailySpendLimit=Number(c.pause_max_daily_spend);
+    if (c.pause_use_max_daily_spend && dailySpendLimit>0 && todaySpend.available && todaySpend.spend>=dailySpendLimit) stopConditions.push(`Расход за ${todaySpend.date} достиг ${todaySpend.spend.toFixed(2)} ₽ при лимите ${dailySpendLimit} ₽`);
+    if (stopConditions.length) return pauseCampaign(c,before,stopConditions.join('; '));
   }
   let reason='';
   if (c.use_time_window && !isMoscowTimeAllowed(c.time_from,c.time_to)) reason=`Вне разрешённого времени (${c.time_from}–${c.time_to} МСК)`;
@@ -573,6 +580,7 @@ function mondayOf(value){const d=new Date(`${String(value).slice(0,10)}T00:00:00
 function weekLabel(value){const a=new Date(`${value}T00:00:00Z`),b=new Date(a);b.setUTCDate(b.getUTCDate()+6);const f=d=>new Intl.DateTimeFormat('ru-RU',{timeZone:'UTC',day:'2-digit',month:'2-digit',year:'numeric'}).format(d);return `${f(a)} — ${f(b)}`}
 function moscowDateRange(days){const to=ymdMoscow(new Date()),fromDate=new Date(`${to}T00:00:00Z`);fromDate.setUTCDate(fromDate.getUTCDate()-(Math.max(1,Math.min(31,Number(days)||7))-1));return{from:fromDate.toISOString().slice(0,10),to}}
 function campaignMetricsForDays(campaignId,days){const range=moscowDateRange(days),row=db.prepare(`SELECT SUM(views) views,SUM(clicks) clicks,SUM(orders) orders,SUM(spend) spend,SUM(revenue) revenue,COUNT(*) records FROM campaign_daily_stats WHERE campaign_id=? AND stat_date BETWEEN ? AND ?`).get(campaignId,range.from,range.to),views=Number(row?.views||0),clicks=Number(row?.clicks||0),orders=Number(row?.orders||0),spend=Number(row?.spend||0),revenue=Number(row?.revenue||0);return{available:Number(row?.records||0)>0,from:range.from,to:range.to,views,clicks,orders,spend,revenue,ctr:views?clicks*100/views:0,drr:revenue?spend*100/revenue:(spend>0?999999:0)}}
+function campaignSpendForMoscowToday(campaignId,entityId=1){const date=ymdMoscow(new Date()),row=db.prepare(`SELECT spend FROM campaign_daily_stats WHERE campaign_id=? AND legal_entity_id=? AND stat_date=?`).get(campaignId,Number(entityId)||1,date);return{available:Boolean(row),date,spend:Number(row?.spend||0)}}
 function migrateColumn(table,column,definition){const columns=db.prepare(`PRAGMA table_info(${table})`).all();if(!columns.some(x=>x.name===column))db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);}
 function ensureDefaultLegalEntity(){
   if(!db.prepare('SELECT id FROM legal_entities LIMIT 1').get()){const s=db.prepare('SELECT token_enc FROM settings WHERE id=1').get()||{};db.prepare('INSERT INTO legal_entities(id,name,token_enc,enabled,created_at,updated_at) VALUES(1,?,?,1,?,?)').run('Основное юрлицо',s.token_enc||null,now(),now());}
