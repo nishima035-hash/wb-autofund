@@ -12,6 +12,9 @@ if (isProduction && !/^[a-f0-9]{64}$/i.test(process.env.APP_ENCRYPTION_KEY || ''
 if (isProduction && String(process.env.ADMIN_PASSWORD || '').length < 12) throw new Error('В production задайте ADMIN_PASSWORD длиной не менее 12 символов');
 const applicationUsers = loadApplicationUsers();
 if (isProduction && applicationUsers.some(user => user.password.length < 12)) throw new Error('Пароль каждого дополнительного пользователя должен содержать не менее 12 символов');
+const authAttempts = new Map();
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_MAX_FAILURES = 10;
 const DATA = join(process.cwd(), 'data');
 mkdirSync(DATA, { recursive: true });
 const db = new DatabaseSync(join(DATA, 'wb-autofund.sqlite'));
@@ -88,14 +91,19 @@ if(process.env.IMPORT_DIARY_ON_START==='true') importDiaryData();
 const mime = {'.html':'text/html; charset=utf-8','.css':'text/css; charset=utf-8','.js':'text/javascript; charset=utf-8','.svg':'image/svg+xml'};
 const server = http.createServer(async (req,res) => {
   try {
+    applySecurityHeaders(req,res);
     const url = new URL(req.url, `http://${req.headers.host}`);
-    if (url.pathname!=='/api/health' && isProduction && !authorized(req)) { res.writeHead(401,{'www-authenticate':'Basic realm="WB AutoFund", charset="UTF-8"','content-type':'text/plain; charset=utf-8'}); return res.end('Требуется вход'); }
+    if (url.pathname!=='/api/health' && isProduction) {
+      const authState=authorizeRequest(req);
+      if(authState.blocked)return send(res,429,{error:'Слишком много неудачных попыток входа. Повторите через 15 минут'});
+      if(!authState.user){res.writeHead(401,{'www-authenticate':'Basic realm="WB AutoFund", charset="UTF-8"','content-type':'text/plain; charset=utf-8','cache-control':'no-store'});return res.end('Требуется вход')}
+    }
     if (url.pathname.startsWith('/api/')) return await api(req,res,url);
     const file = url.pathname === '/' ? 'index.html' : url.pathname.slice(1);
     const path = join(process.cwd(),'public',file);
     if (!existsSync(path) || !path.startsWith(join(process.cwd(),'public'))) return send(res,404,{error:'Не найдено'});
     res.writeHead(200, {'content-type': mime[extname(path)] || 'application/octet-stream'}); res.end(readFileSync(path));
-  } catch (e) { console.error(e); send(res,500,{error:e.message || 'Ошибка сервера'}); }
+  } catch (e) { console.error(e); send(res,Number(e.status)||500,{error:e.message || 'Ошибка сервера'}); }
 });
 
 async function api(req,res,url) {
@@ -105,12 +113,11 @@ async function api(req,res,url) {
     || (req.method==='POST' && url.pathname==='/api/settings');
   if(adminOnly&&!isAdmin(req))return send(res,403,{error:'Доступ к настройкам разрешён только администратору'});
   const body = ['POST','PUT','PATCH'].includes(req.method) ? await jsonBody(req) : {};
-  if (req.method==='GET' && url.pathname==='/api/legal-entities') return send(res,200,{entities:listLegalEntities(),active_entity_id:activeEntityId(url)});
+  if (req.method==='GET' && url.pathname==='/api/legal-entities') return send(res,200,{entities:listLegalEntities(req),active_entity_id:activeEntityId(url,req)});
   if (req.method==='POST' && url.pathname==='/api/legal-entities') {
     const name=String(body.name||'').trim();if(!name)throw new Error('Укажите название юрлица');
     const token=String(body.token||'').trim();if(!token)throw new Error('Укажите API-токен WB');
     const result=db.prepare('INSERT INTO legal_entities(name,token_enc,enabled,created_at,updated_at) VALUES(?,?,1,?,?)').run(name,encrypt(token),now(),now());
-    db.prepare('UPDATE settings SET active_entity_id=?,updated_at=? WHERE id=1').run(Number(result.lastInsertRowid),now());
     return send(res,201,{ok:true,id:Number(result.lastInsertRowid)});
   }
   const entityMatch=url.pathname.match(/^\/api\/legal-entities\/(\d+)$/);
@@ -122,10 +129,10 @@ async function api(req,res,url) {
   }
   if (req.method==='POST' && url.pathname==='/api/legal-entities/select') {
     const id=Number(body.id);if(!db.prepare('SELECT id FROM legal_entities WHERE id=?').get(id))throw new Error('Юрлицо не найдено');
-    db.prepare('UPDATE settings SET active_entity_id=?,updated_at=? WHERE id=1').run(id,now());return send(res,200,{ok:true});
+    requireEntityAccess(req,id);return send(res,200,{ok:true,id});
   }
   if (req.method==='GET' && url.pathname==='/api/dashboard') {
-    const entityId=activeEntityId(url);
+    const entityId=activeEntityId(url,req);
     const campaigns=db.prepare(`SELECT c.*,r.enabled,r.auto_resume,r.resume_daily_limit,r.resume_delay_seconds,r.use_max_drr,r.max_drr,r.use_min_ctr,r.min_ctr,r.use_min_views,r.min_views,r.use_min_orders,r.min_orders,r.metrics_days,r.use_time_window,r.time_from,r.time_to,r.min_budget,r.deposit_amount,r.daily_limit,r.funding_type,r.auto_pause,r.pause_use_max_drr,r.pause_max_drr,r.pause_use_min_ctr,r.pause_min_ctr,r.pause_use_min_views,r.pause_min_views,r.pause_use_min_orders,r.pause_min_orders,r.pause_use_max_daily_spend,r.pause_max_daily_spend,r.schedule_enabled,r.schedule_windows,r.schedule_auto_resume FROM campaigns c LEFT JOIN rules r ON r.campaign_id=c.id WHERE c.status<>'archived' AND c.legal_entity_id=? ORDER BY c.id`).all(entityId);
     let periodFrom=url.searchParams.get('from'),periodTo=url.searchParams.get('to');
     const requestedDays=Number(url.searchParams.get('days'));
@@ -137,13 +144,13 @@ async function api(req,res,url) {
     const operations=db.prepare(`SELECT * FROM operations WHERE legal_entity_id=? ORDER BY id DESC LIMIT 100`).all(entityId);
     const activityOperations=db.prepare(`SELECT * FROM operations WHERE legal_entity_id=? AND status IN ('deposited','resumed','paused') ORDER BY id DESC LIMIT 100`).all(entityId);
     const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,auto_sync_enabled,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
-    const entities=listLegalEntities(),entity=entities.find(x=>x.id===entityId);
+    const entities=listLegalEntities(req),entity=entities.find(x=>x.id===entityId);
     const currentUser=authenticatedUser(req);
     return send(res,200,{campaigns,operations,activity_operations:activityOperations,entities,active_entity_id:entityId,current_user:{username:currentUser?.username||'',role:currentUser?.role||'user',is_admin:currentUser?.role==='admin'},settings:{...s,token_saved:entity?.token_saved||0,display_from:periodFrom||null,display_to:periodTo||null,live_deposits:process.env.WB_LIVE_DEPOSITS==='true',live_resume:process.env.WB_LIVE_RESUME==='true'}});
   }
-    if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataWithOrders(url.searchParams.get('campaign_id'),url.searchParams.get('week'),activeEntityId(url)));
-  if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsDataV2(url.searchParams.get('from'),url.searchParams.get('to'),url.searchParams.get('campaign_id'),activeEntityId(url)));
-  if (req.method==='GET' && url.pathname==='/api/shared/export') return send(res,200,sharedExport(url.searchParams.get('from'),url.searchParams.get('to')));
+    if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataWithOrders(url.searchParams.get('campaign_id'),url.searchParams.get('week'),activeEntityId(url,req)));
+  if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsDataV2(url.searchParams.get('from'),url.searchParams.get('to'),url.searchParams.get('campaign_id'),activeEntityId(url,req)));
+  if (req.method==='GET' && url.pathname==='/api/shared/export') return send(res,200,sharedExport(url.searchParams.get('from'),url.searchParams.get('to'),activeEntityId(url,req)));
   if (req.method==='POST' && url.pathname==='/api/settings') {
     const current=db.prepare('SELECT * FROM settings WHERE id=1').get();
     const entityId=Number(body.legal_entity_id)||Number(current.active_entity_id)||1;
@@ -154,6 +161,7 @@ async function api(req,res,url) {
   const ruleMatch=url.pathname.match(/^\/api\/campaigns\/(\d+)\/rule$/);
   if (req.method==='PUT' && ruleMatch) {
     const id=Number(ruleMatch[1]);
+    const campaignOwner=db.prepare('SELECT legal_entity_id FROM campaigns WHERE id=?').get(id);if(!campaignOwner)throw httpError(404,'Кампания не найдена');requireEntityAccess(req,campaignOwner.legal_entity_id);
     const currentRule=db.prepare('SELECT metrics_days,auto_resume,resume_daily_limit,resume_delay_seconds FROM rules WHERE campaign_id=?').get(id);
     db.prepare(`INSERT INTO rules(campaign_id,enabled,auto_resume,resume_daily_limit,resume_delay_seconds,use_max_drr,max_drr,use_min_ctr,min_ctr,use_min_views,min_views,use_min_orders,min_orders,metrics_days,use_time_window,time_from,time_to,min_budget,deposit_amount,daily_limit,funding_type,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(campaign_id) DO UPDATE SET enabled=excluded.enabled,auto_resume=excluded.auto_resume,resume_daily_limit=excluded.resume_daily_limit,resume_delay_seconds=excluded.resume_delay_seconds,use_max_drr=excluded.use_max_drr,max_drr=excluded.max_drr,use_min_ctr=excluded.use_min_ctr,min_ctr=excluded.min_ctr,use_min_views=excluded.use_min_views,min_views=excluded.min_views,use_min_orders=excluded.use_min_orders,min_orders=excluded.min_orders,metrics_days=excluded.metrics_days,use_time_window=excluded.use_time_window,time_from=excluded.time_from,time_to=excluded.time_to,min_budget=excluded.min_budget,deposit_amount=excluded.deposit_amount,daily_limit=excluded.daily_limit,funding_type=excluded.funding_type,updated_at=excluded.updated_at`).run(id,body.enabled?1:0,body.auto_resume==null?Number(currentRule?.auto_resume||0):(body.auto_resume?1:0),clamp(body.resume_daily_limit??currentRule?.resume_daily_limit??1,1,24),clamp(body.resume_delay_seconds??currentRule?.resume_delay_seconds??15,5,300),body.use_max_drr!==false?1:0,positive(body.max_drr),body.use_min_ctr!==false?1:0,positive(body.min_ctr),body.use_min_views?1:0,Math.round(positive(body.min_views)),body.use_min_orders?1:0,Math.round(positive(body.min_orders)),clamp(body.metrics_days??currentRule?.metrics_days??7,1,31),body.use_time_window?1:0,validTime(body.time_from,'00:00'),validTime(body.time_to,'23:59'),positive(body.min_budget),Math.round(positive(body.deposit_amount)),clamp(body.daily_limit,1,100),[0,1,3].includes(Number(body.funding_type))?Number(body.funding_type):1,now());
     db.prepare(`UPDATE rules SET auto_pause=?,pause_use_max_drr=?,pause_max_drr=?,pause_use_min_ctr=?,pause_min_ctr=?,pause_use_min_views=?,pause_min_views=?,pause_use_min_orders=?,pause_min_orders=?,pause_use_max_daily_spend=?,pause_max_daily_spend=? WHERE campaign_id=?`).run(body.auto_pause?1:0,body.pause_use_max_drr?1:0,positive(body.pause_max_drr),body.pause_use_min_ctr?1:0,positive(body.pause_min_ctr),body.pause_use_min_views?1:0,Math.round(positive(body.pause_min_views)),body.pause_use_min_orders?1:0,Math.round(positive(body.pause_min_orders)),body.pause_use_max_daily_spend?1:0,positive(body.pause_max_daily_spend),id);
@@ -164,16 +172,18 @@ async function api(req,res,url) {
     return send(res,200,{ok:true,evaluation_queued:true,live_deposit_ready:liveDepositReady,live_resume_ready:Boolean(settings.demo_mode)||process.env.WB_LIVE_RESUME==='true',live_pause_ready:Boolean(settings.demo_mode)||process.env.WB_LIVE_PAUSE==='true'});
   }
   if (req.method==='POST' && url.pathname==='/api/sync') {
+    const entityId=Number(body.legal_entity_id)||activeEntityId(url,req);requireEntityAccess(req,entityId);
     const alreadyRunning=Boolean(activeSync);
-    if(!alreadyRunning) syncCampaigns(Number(body.legal_entity_id)||activeEntityId(url)).catch(error=>console.error('Manual WB sync failed:',error));
+    if(!alreadyRunning) syncCampaigns(entityId).catch(error=>console.error('Manual WB sync failed:',error));
     return send(res,202,{ok:true,started:!alreadyRunning,running:true});
   }
-  if (req.method==='POST' && url.pathname==='/api/run') { const result=await evaluateAll(); return send(res,200,result); }
+  if (req.method==='POST' && url.pathname==='/api/run') { const result=await evaluateAll(permittedEntityIds(req)); return send(res,200,result); }
   return send(res,404,{error:'Метод не найден'});
 }
 
-async function evaluateAll() {
-  const rows=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE r.enabled=1 OR r.auto_resume=1 OR r.auto_pause=1 OR r.schedule_enabled=1 OR c.schedule_paused=1`).all();
+async function evaluateAll(entityIds=null) {
+  let rows=db.prepare(`SELECT c.*,r.* FROM campaigns c JOIN rules r ON r.campaign_id=c.id WHERE r.enabled=1 OR r.auto_resume=1 OR r.auto_pause=1 OR r.schedule_enabled=1 OR c.schedule_paused=1`).all();
+  if(Array.isArray(entityIds))rows=rows.filter(row=>entityIds.includes(Number(row.legal_entity_id)));
   let deposited=0,resumed=0,skipped=0;
   for (const c of rows) { const result=await evaluate(c); result==='deposited'?deposited++:result==='resumed'?resumed++:skipped++; }
   return {checked:rows.length,deposited,resumed,skipped};
@@ -185,7 +195,7 @@ async function evaluateCampaign(campaignId) {
 }
 
 async function evaluate(c) {
-  const before=Number(c.budget),periodMetrics=campaignMetricsForDays(c.campaign_id,c.metrics_days||7);
+  const before=Number(c.budget),periodMetrics=campaignMetricsForDays(c.campaign_id,c.metrics_days||7,c.legal_entity_id);
   const scheduledNow=Boolean(c.schedule_enabled)&&isInsideSchedule(c.schedule_windows);
   if(scheduledNow&&c.status==='active')return pauseCampaignBySchedule(c,before);
   if(!scheduledNow&&c.schedule_paused&&c.schedule_auto_resume)return resumeCampaignBySchedule(c,before);
@@ -580,19 +590,21 @@ function analyticsDataV2(from,to,campaignId,entityId=1){
   const products=db.prepare(`SELECT b.*,ch.old_value,ch.new_value,ch.changed_at,(SELECT COUNT(*) FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ?) changes FROM campaign_bids b LEFT JOIN campaign_bid_changes ch ON ch.rowid=(SELECT x.rowid FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ? ORDER BY x.changed_at DESC LIMIT 1) WHERE b.campaign_id=? ORDER BY b.nm_id,b.placement`).all(`${start} 00:00:00`,`${end} 23:59:59`,`${start} 00:00:00`,`${end} 23:59:59`,selected);
   return{from:start,to:end,selected_id:selected,rows,products};
 }
-function sharedExport(from,to){const end=to&&/^\d{4}-\d{2}-\d{2}$/.test(to)?to:ymdMoscow(new Date()),start=from&&/^\d{4}-\d{2}-\d{2}$/.test(from)?from:(()=>{const d=new Date();d.setUTCDate(d.getUTCDate()-6);return ymdMoscow(d)})();return{generated_at:now(),from:start,to:end,campaigns:db.prepare(`SELECT * FROM campaigns WHERE status<>'archived' ORDER BY id`).all(),daily_stats:db.prepare(`SELECT * FROM campaign_daily_stats WHERE stat_date BETWEEN ? AND ? ORDER BY stat_date,campaign_id`).all(start,end),bids:db.prepare(`SELECT * FROM campaign_bids ORDER BY campaign_id,nm_id,placement`).all(),bid_changes:db.prepare(`SELECT * FROM campaign_bid_changes WHERE changed_at BETWEEN ? AND ? ORDER BY changed_at`).all(`${start} 00:00:00`,`${end} 23:59:59`),hourly:db.prepare(`SELECT * FROM hourly_snapshots WHERE snapshot_at BETWEEN ? AND ? ORDER BY snapshot_at`).all(`${start} 00:00:00`,`${end} 23:59:59`)}}
+function sharedExport(from,to,entityId){const id=Number(entityId)||1,end=to&&/^\d{4}-\d{2}-\d{2}$/.test(to)?to:ymdMoscow(new Date()),start=from&&/^\d{4}-\d{2}-\d{2}$/.test(from)?from:(()=>{const d=new Date();d.setUTCDate(d.getUTCDate()-6);return ymdMoscow(d)})();return{generated_at:now(),legal_entity_id:id,from:start,to:end,campaigns:db.prepare(`SELECT * FROM campaigns WHERE legal_entity_id=? AND status<>'archived' ORDER BY id`).all(id),daily_stats:db.prepare(`SELECT * FROM campaign_daily_stats WHERE legal_entity_id=? AND stat_date BETWEEN ? AND ? ORDER BY stat_date,campaign_id`).all(id,start,end),bids:db.prepare(`SELECT b.* FROM campaign_bids b JOIN campaigns c ON c.id=b.campaign_id WHERE c.legal_entity_id=? ORDER BY b.campaign_id,b.nm_id,b.placement`).all(id),bid_changes:db.prepare(`SELECT x.* FROM campaign_bid_changes x JOIN campaigns c ON c.id=x.campaign_id WHERE c.legal_entity_id=? AND x.changed_at BETWEEN ? AND ? ORDER BY x.changed_at`).all(id,`${start} 00:00:00`,`${end} 23:59:59`),hourly:db.prepare(`SELECT * FROM hourly_snapshots WHERE legal_entity_id=? AND snapshot_at BETWEEN ? AND ? ORDER BY snapshot_at`).all(id,`${start} 00:00:00`,`${end} 23:59:59`)}}
 function mondayOf(value){const d=new Date(`${String(value).slice(0,10)}T00:00:00Z`);if(Number.isNaN(d.getTime()))return weekMonday();d.setUTCDate(d.getUTCDate()-((d.getUTCDay()+6)%7));return d.toISOString().slice(0,10)}
 function weekLabel(value){const a=new Date(`${value}T00:00:00Z`),b=new Date(a);b.setUTCDate(b.getUTCDate()+6);const f=d=>new Intl.DateTimeFormat('ru-RU',{timeZone:'UTC',day:'2-digit',month:'2-digit',year:'numeric'}).format(d);return `${f(a)} — ${f(b)}`}
 function moscowDateRange(days){const to=ymdMoscow(new Date()),fromDate=new Date(`${to}T00:00:00Z`);fromDate.setUTCDate(fromDate.getUTCDate()-(Math.max(1,Math.min(31,Number(days)||7))-1));return{from:fromDate.toISOString().slice(0,10),to}}
-function campaignMetricsForDays(campaignId,days){const range=moscowDateRange(days),row=db.prepare(`SELECT SUM(views) views,SUM(clicks) clicks,SUM(orders) orders,SUM(spend) spend,SUM(revenue) revenue,COUNT(*) records FROM campaign_daily_stats WHERE campaign_id=? AND stat_date BETWEEN ? AND ?`).get(campaignId,range.from,range.to),views=Number(row?.views||0),clicks=Number(row?.clicks||0),orders=Number(row?.orders||0),spend=Number(row?.spend||0),revenue=Number(row?.revenue||0);return{available:Number(row?.records||0)>0,from:range.from,to:range.to,views,clicks,orders,spend,revenue,ctr:views?clicks*100/views:0,drr:revenue?spend*100/revenue:(spend>0?999999:0)}}
+function campaignMetricsForDays(campaignId,days,entityId=1){const range=moscowDateRange(days),row=db.prepare(`SELECT SUM(views) views,SUM(clicks) clicks,SUM(orders) orders,SUM(spend) spend,SUM(revenue) revenue,COUNT(*) records FROM campaign_daily_stats WHERE campaign_id=? AND legal_entity_id=? AND stat_date BETWEEN ? AND ?`).get(campaignId,Number(entityId)||1,range.from,range.to),views=Number(row?.views||0),clicks=Number(row?.clicks||0),orders=Number(row?.orders||0),spend=Number(row?.spend||0),revenue=Number(row?.revenue||0);return{available:Number(row?.records||0)>0,from:range.from,to:range.to,views,clicks,orders,spend,revenue,ctr:views?clicks*100/views:0,drr:revenue?spend*100/revenue:(spend>0?999999:0)}}
 function campaignSpendForMoscowToday(campaignId,entityId=1){const date=ymdMoscow(new Date()),row=db.prepare(`SELECT spend FROM campaign_daily_stats WHERE campaign_id=? AND legal_entity_id=? AND stat_date=?`).get(campaignId,Number(entityId)||1,date);return{available:Boolean(row),date,spend:Number(row?.spend||0)}}
 function migrateColumn(table,column,definition){const columns=db.prepare(`PRAGMA table_info(${table})`).all();if(!columns.some(x=>x.name===column))db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);}
 function ensureDefaultLegalEntity(){
   if(!db.prepare('SELECT id FROM legal_entities LIMIT 1').get()){const s=db.prepare('SELECT token_enc FROM settings WHERE id=1').get()||{};db.prepare('INSERT INTO legal_entities(id,name,token_enc,enabled,created_at,updated_at) VALUES(1,?,?,1,?,?)').run('Основное юрлицо',s.token_enc||null,now(),now());}
   const s=db.prepare('SELECT active_entity_id FROM settings WHERE id=1').get();if(!s?.active_entity_id)db.prepare('UPDATE settings SET active_entity_id=1 WHERE id=1').run();
 }
-function listLegalEntities(){return db.prepare('SELECT id,name,enabled,token_enc IS NOT NULL AS token_saved,created_at,updated_at FROM legal_entities ORDER BY id').all().map(x=>({...x,id:Number(x.id)}));}
-function activeEntityId(url){const requested=Number(url?.searchParams?.get('legal_entity_id'));if(requested&&db.prepare('SELECT id FROM legal_entities WHERE id=?').get(requested))return requested;return Number(db.prepare('SELECT active_entity_id FROM settings WHERE id=1').get()?.active_entity_id)||1;}
+function permittedEntityIds(req){if(!req)return null;const user=authenticatedUser(req);if(!user)return[];return user.role==='admin'||!Array.isArray(user.legalEntityIds)?null:user.legalEntityIds}
+function requireEntityAccess(req,id){const entityId=Number(id),exists=db.prepare('SELECT id FROM legal_entities WHERE id=? AND enabled=1').get(entityId);if(!exists)throw httpError(404,'Юрлицо не найдено');const allowed=permittedEntityIds(req);if(Array.isArray(allowed)&&!allowed.includes(entityId))throw httpError(403,'Нет доступа к этому юрлицу');return entityId}
+function listLegalEntities(req=null){const rows=db.prepare('SELECT id,name,enabled,token_enc IS NOT NULL AS token_saved,created_at,updated_at FROM legal_entities WHERE enabled=1 ORDER BY id').all().map(x=>({...x,id:Number(x.id)})),allowed=permittedEntityIds(req);return Array.isArray(allowed)?rows.filter(x=>allowed.includes(x.id)):rows}
+function activeEntityId(url,req=null){const requested=Number(url?.searchParams?.get('legal_entity_id'));if(requested)return requireEntityAccess(req,requested);const rows=listLegalEntities(req);if(!rows.length)throw httpError(403,'Пользователю не назначено ни одного юрлица');const preferred=Number(db.prepare('SELECT active_entity_id FROM settings WHERE id=1').get()?.active_entity_id)||1;return rows.some(x=>x.id===preferred)?preferred:rows[0].id}
 function tokenForEntity(id){const entity=db.prepare('SELECT token_enc FROM legal_entities WHERE id=? AND enabled=1').get(Number(id)||1);return decrypt(entity?.token_enc);}
 function normalizeScheduleWindows(value){let rows=value;if(typeof rows==='string')try{rows=JSON.parse(rows)}catch{rows=[]}if(!Array.isArray(rows))return[];return rows.slice(0,12).map(row=>({from:validTime(row?.from,'00:00'),to:validTime(row?.to,'00:00')})).filter(row=>row.from!==row.to)}
 function isInsideSchedule(value,date=new Date()){const windows=normalizeScheduleWindows(value),parts=new Intl.DateTimeFormat('en-GB',{timeZone:'Europe/Moscow',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).formatToParts(date),hour=Number(parts.find(x=>x.type==='hour')?.value||0),minute=Number(parts.find(x=>x.type==='minute')?.value||0),nowMinutes=hour*60+minute,toMinutes=time=>Number(time.slice(0,2))*60+Number(time.slice(3));return windows.some(window=>{const from=toMinutes(window.from),to=toMinutes(window.to);return from<to?nowMinutes>=from&&nowMinutes<to:nowMinutes>=from||nowMinutes<to})}
@@ -608,10 +620,23 @@ function encrypt(s){const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',key(
 function decrypt(s){if(!s)throw new Error('Токен WB не сохранён');const [i,t,d]=s.split('.').map(x=>Buffer.from(x,'base64url'));const c=createDecipheriv('aes-256-gcm',key(),i);c.setAuthTag(t);return Buffer.concat([c.update(d),c.final()]).toString();}
 function loadEnv(){if(!existsSync('.env'))return;for(const line of readFileSync('.env','utf8').split(/\r?\n/)){const m=line.match(/^([^#=]+)=(.*)$/);if(m&&!process.env[m[1].trim()])process.env[m[1].trim()]=m[2].trim();}}
 function authenticatedUser(req){const value=req.headers.authorization||'';if(!value.startsWith('Basic '))return null;let decoded='';try{decoded=Buffer.from(value.slice(6),'base64').toString('utf8')}catch{return null}const separator=decoded.indexOf(':');if(separator<0)return null;const username=decoded.slice(0,separator),password=decoded.slice(separator+1);return applicationUsers.find(user=>safeEqual(username,user.username)&&safeEqual(password,user.password))||null;}
+function authorizeRequest(req){
+  const address=String(req.headers['x-forwarded-for']||req.socket?.remoteAddress||'unknown').split(',')[0].trim();
+  const current=Date.now(),previous=authAttempts.get(address);
+  if(previous&&current-previous.startedAt<AUTH_WINDOW_MS&&previous.failures>=AUTH_MAX_FAILURES)return{user:null,blocked:true};
+  if(previous&&current-previous.startedAt>=AUTH_WINDOW_MS)authAttempts.delete(address);
+  const user=authenticatedUser(req);
+  if(user){authAttempts.delete(address);return{user,blocked:false}}
+  const state=authAttempts.get(address);
+  authAttempts.set(address,state?{startedAt:state.startedAt,failures:state.failures+1}:{startedAt:current,failures:1});
+  return{user:null,blocked:false};
+}
 function authorized(req){return Boolean(authenticatedUser(req))}
 function isAdmin(req){return authenticatedUser(req)?.role==='admin'}
+function httpError(status,message){const error=new Error(message);error.status=status;return error}
+function applySecurityHeaders(req,res){res.setHeader('x-content-type-options','nosniff');res.setHeader('x-frame-options','DENY');res.setHeader('referrer-policy','no-referrer');res.setHeader('permissions-policy','camera=(), microphone=(), geolocation=()');res.setHeader('cache-control','no-store');res.setHeader('content-security-policy',"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'");if(String(req.headers['x-forwarded-proto']||'').toLowerCase()==='https')res.setHeader('strict-transport-security','max-age=31536000; includeSubDomains')}
 function loadApplicationUsers(){
-  const users=[{username:process.env.ADMIN_USERNAME||'admin',password:process.env.ADMIN_PASSWORD||'',role:'admin'}];
+  const users=[{username:process.env.ADMIN_USERNAME||'admin',password:process.env.ADMIN_PASSWORD||'',role:'admin',legalEntityIds:null}];
   const raw=String(process.env.ADDITIONAL_USERS_JSON||'').trim();
   if(!raw)return users;
   let extra;
@@ -622,7 +647,8 @@ function loadApplicationUsers(){
     const username=String(item?.username||'').trim(),password=String(item?.password||'');
     if(!username||!password)throw new Error('У каждого дополнительного пользователя должны быть username и password');
     if(names.has(username))throw new Error(`Логин пользователя повторяется: ${username}`);
-    names.add(username);users.push({username,password,role:'user'});
+    const legalEntityIds=Array.isArray(item?.legal_entity_ids)?[...new Set(item.legal_entity_ids.map(Number).filter(Number.isInteger).filter(id=>id>0))]:null;
+    names.add(username);users.push({username,password,role:'user',legalEntityIds});
   }
   return users;
 }

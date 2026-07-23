@@ -6,6 +6,7 @@ WORKDIR /app
 COPY package.json ./
 COPY server.js ./
 COPY import-diary.js ./
+COPY validate-config.js ./
 COPY public ./public
 RUN mkdir -p /app/data && chown -R node:node /app
 

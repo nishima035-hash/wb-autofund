@@ -1,6 +1,18 @@
-let state={},query='';const $=s=>document.querySelector(s),money=n=>new Intl.NumberFormat('ru-RU',{style:'currency',currency:'RUB',maximumFractionDigits:0}).format(n||0),number=n=>new Intl.NumberFormat('ru-RU').format(Math.round(n||0));
+let state={},query='',selectedLegalEntityId=Number(localStorage.getItem('wb-autofund-entity-id'))||0;const $=s=>document.querySelector(s),money=n=>new Intl.NumberFormat('ru-RU',{style:'currency',currency:'RUB',maximumFractionDigits:0}).format(n||0),number=n=>new Intl.NumberFormat('ru-RU').format(Math.round(n||0));
 async function request(path,options={}){const r=await fetch(path,{headers:{'content-type':'application/json'},...options}),text=await r.text();let j;try{j=text?JSON.parse(text):{}}catch{throw new Error(r.ok?'Сервер вернул некорректный ответ':`Ошибка сервера ${r.status}. Повторите позже`)}if(!r.ok)throw new Error(j.error||`Ошибка сервера ${r.status}`);return j}
-async function load(){state=await request('/api/dashboard');render()}
+function withEntity(path){if(!selectedLegalEntityId||/[?&]legal_entity_id=/.test(path))return path;const separator=path.includes('?')?'&':'?';return `${path}${separator}legal_entity_id=${selectedLegalEntityId}`}
+const requestWithoutEntity=request;
+request=async(path,options={})=>{
+  const method=String(options.method||'GET').toUpperCase();
+  if(method==='GET'&&/^\/api\/(dashboard|hourly|analytics|shared\/export)(?:[/?]|$)/.test(path))path=withEntity(path);
+  if(method==='POST'&&/^\/api\/(sync|run)$/.test(path)&&selectedLegalEntityId){
+    let body={};try{body=options.body?JSON.parse(options.body):{}}catch{}
+    options={...options,body:JSON.stringify({...body,legal_entity_id:selectedLegalEntityId})};
+  }
+  return requestWithoutEntity(path,options);
+};
+async function requestDashboard(){let data;try{data=await request(withEntity('/api/dashboard'))}catch(error){if(!selectedLegalEntityId||!/403|404/.test(String(error.message)))throw error;selectedLegalEntityId=0;localStorage.removeItem('wb-autofund-entity-id');data=await request('/api/dashboard')}selectedLegalEntityId=Number(data.active_entity_id||data.entities?.[0]?.id||0);if(selectedLegalEntityId)localStorage.setItem('wb-autofund-entity-id',String(selectedLegalEntityId));return data}
+async function load(){state=await requestDashboard();render()}
 function render(){const cs=state.campaigns.filter(c=>!query||c.name.toLowerCase().includes(query)||String(c.id).includes(query)),available=state.campaigns.filter(c=>c.metrics_available||c.source==='demo'),spend=available.reduce((s,c)=>s+Number(c.spend||0),0),revenue=available.reduce((s,c)=>s+Number(c.revenue||0),0),avgCtr=available.length?available.reduce((s,c)=>s+Number(c.ctr||0),0)/available.length:0;
   $('#stats').innerHTML=stat('Сумма заказов',money(revenue))+stat('Затраты',money(spend))+stat('Доля затрат',`${revenue?(spend/revenue*100).toFixed(2):0}%`)+stat('CTR',`${avgCtr.toFixed(2)}%`);$('#mode').textContent=state.settings.demo_mode?'Демо-режим':'Подключено к WB';$('#shown').textContent=cs.length;$('#currentPeriod').textContent=`Последние ${state.settings.stats_days||7} дней`;
   $('#campaignRows').innerHTML=cs.map(c=>{const ok=c.metrics_available||c.source==='demo',metric=v=>ok?`${Number(v||0).toFixed(2)}%`:'—';return `<tr><td><span class="status ${c.status}">${c.status==='active'?'Активна':'Приостановлена'}</span></td><td><span class="campaign-name">${esc(c.name)}</span><span class="campaign-meta">ID ${c.id}</span></td><td>CPC</td><td><span class="money">${money(c.budget)}</span></td><td>${money(c.spend)}</td><td>${ok?number(c.views):'—'}</td><td><b class="metric">${metric(c.ctr)}</b></td><td><b class="metric">${metric(c.drr)}</b></td><td><span class="toggle ${c.enabled?'on':''}"></span><span class="rule-summary">${c.enabled?'Включено':'Выключено'}</span></td><td><button onclick="openRule(${c.id})">Настроить</button></td></tr>`}).join('');
@@ -68,11 +80,11 @@ async function refreshCurrentEntityView(){
   if(current==='hourlyPage')await loadHourlyV2();
   if(current==='analyticsPage')await loadAnalyticsV2();
 }
-async function selectLegalEntity(id){if(id===Number(state.active_entity_id))return;await request('/api/legal-entities/select',{method:'POST',body:JSON.stringify({id})});await load();await refreshCurrentEntityView();toast('Юрлицо выбрано')}
+async function selectLegalEntity(id){if(id===Number(state.active_entity_id))return;selectedLegalEntityId=Number(id);localStorage.setItem('wb-autofund-entity-id',String(selectedLegalEntityId));await load();await refreshCurrentEntityView();toast('Юрлицо выбрано')}
 function applyAccessControl(){const button=document.querySelector('.side[data-page="settingsPage"]'),admin=Boolean(state.current_user?.is_admin);if(button){button.hidden=!admin;button.style.display=admin?'':'none'}const page=$('#settingsPage');if(!admin&&page&&!page.classList.contains('hidden')){page.classList.add('hidden');$('#campaignsPage')?.classList.remove('hidden');document.querySelectorAll('.side').forEach(x=>x.classList.remove('active'));document.querySelector('.side[data-page="campaignsPage"]')?.classList.add('active')}}
-const loadForEntities=load;load=async()=>{state=await request('/api/dashboard');applyAccessControl();viewTabs[1]?.classList.contains('active')?renderRulesList():render();renderLegalEntities()};
+const loadForEntities=load;load=async()=>{state=await requestDashboard();applyAccessControl();viewTabs[1]?.classList.contains('active')?renderRulesList():render();renderLegalEntities()};
 if($('#settingsEntity'))$('#settingsEntity').onchange=event=>selectLegalEntity(Number(event.target.value));
-if($('#addEntity'))$('#addEntity').onclick=async()=>{try{await request('/api/legal-entities',{method:'POST',body:JSON.stringify({name:$('#newEntityName').value,token:$('#newEntityToken').value})});$('#newEntityName').value='';$('#newEntityToken').value='';await load();toast('Юрлицо добавлено')}catch(error){toast(error.message)}};
+if($('#addEntity'))$('#addEntity').onclick=async()=>{try{const created=await request('/api/legal-entities',{method:'POST',body:JSON.stringify({name:$('#newEntityName').value,token:$('#newEntityToken').value})});selectedLegalEntityId=Number(created.id||selectedLegalEntityId);localStorage.setItem('wb-autofund-entity-id',String(selectedLegalEntityId));$('#newEntityName').value='';$('#newEntityToken').value='';await load();toast('Юрлицо добавлено')}catch(error){toast(error.message)}};
 if($('#saveSettings'))$('#saveSettings').onclick=()=>act('/api/settings',{method:'POST',body:JSON.stringify({legal_entity_id:Number($('#settingsEntity').value),token:$('#token').value,demo_mode:$('#demo').checked,auto_sync_enabled:$('#autoSync').checked,check_minutes:$('#interval').value,stats_days:$('#statsDays').value})},'Настройки сохранены');
 function addApiScopeBadges(input){
   const label=input?.closest('label');if(!label||label.querySelector('.api-scope-row'))return;

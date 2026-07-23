@@ -19,6 +19,22 @@ else
 fi
 
 ${COMPOSE} build --pull
+${COMPOSE} run --rm --no-deps wb-autofund node validate-config.js
+chmod 600 .env
+
+BACKUP_DIR="${APP_DIR}/backups"
+mkdir -p "${BACKUP_DIR}"
+if ${COMPOSE} ps -q wb-autofund >/dev/null 2>&1 && [[ -n "$(${COMPOSE} ps -q wb-autofund)" ]]; then
+  BACKUP_FILE="${BACKUP_DIR}/wb-autofund-$(date +%Y%m%d-%H%M%S).sqlite"
+  ${COMPOSE} exec -T wb-autofund node --input-type=module -e \
+    "import { DatabaseSync } from 'node:sqlite'; const db=new DatabaseSync('/app/data/wb-autofund.sqlite'); db.exec(\"VACUUM INTO '/app/data/predeploy-backup.sqlite'\"); db.close();"
+  docker cp wb-autofund:/app/data/predeploy-backup.sqlite "${BACKUP_FILE}"
+  ${COMPOSE} exec -T wb-autofund node --input-type=module -e \
+    "import { unlinkSync } from 'node:fs'; try { unlinkSync('/app/data/predeploy-backup.sqlite') } catch {}"
+  chmod 600 "${BACKUP_FILE}"
+  echo "Database backup: ${BACKUP_FILE}"
+fi
+
 ${COMPOSE} up -d --remove-orphans
 ${COMPOSE} ps
 curl --fail --retry 10 --retry-delay 2 http://127.0.0.1:4173/api/health

@@ -3,6 +3,10 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "scripts": { "start": "node server.js", "test": "node --test" },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test",
+    "validate:config": "node validate-config.js"
+  },
   "engines": { "node": ">=22.5" }
 }
