@@ -7,6 +7,7 @@ COPY package.json ./
 COPY server.js ./
 COPY import-diary.js ./
 COPY validate-config.js ./
+COPY backup-database.js ./
 COPY public ./public
 RUN mkdir -p /app/data && chown -R node:node /app
 

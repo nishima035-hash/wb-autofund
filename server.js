@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS campaign_bid_history (snapshot_at TEXT NOT NULL, camp
 CREATE TABLE IF NOT EXISTS campaign_bid_changes (changed_at TEXT NOT NULL, campaign_id INTEGER NOT NULL, nm_id TEXT, placement TEXT, old_value TEXT, new_value TEXT, PRIMARY KEY(changed_at,campaign_id,nm_id,placement));
 CREATE TABLE IF NOT EXISTS supplier_orders (legal_entity_id INTEGER NOT NULL, srid TEXT NOT NULL, order_date TEXT NOT NULL, last_change_date TEXT, nm_id TEXT, supplier_article TEXT, total_price REAL, finished_price REAL, is_cancel INTEGER NOT NULL DEFAULT 0, cancel_date TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(legal_entity_id,srid));
 CREATE TABLE IF NOT EXISTS entity_sync_state (legal_entity_id INTEGER PRIMARY KEY, orders_last_change TEXT, orders_last_sync_at TEXT, orders_last_error TEXT);
+CREATE TABLE IF NOT EXISTS user_access_policies (username TEXT PRIMARY KEY, legal_entity_ids TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_supplier_orders_entity_date_nm ON supplier_orders(legal_entity_id,order_date,nm_id);
 INSERT OR IGNORE INTO settings(id,demo_mode,check_minutes,updated_at) VALUES(1,1,5,datetime('now'));`);
 migrateColumn('rules','use_max_drr','INTEGER NOT NULL DEFAULT 1');
@@ -110,9 +111,34 @@ async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{status:'ok',database:'sqlite',time:now()});
   const adminOnly=(req.method==='POST' && url.pathname==='/api/legal-entities')
     || (req.method==='PUT' && /^\/api\/legal-entities\/\d+$/.test(url.pathname))
-    || (req.method==='POST' && url.pathname==='/api/settings');
+    || (req.method==='POST' && url.pathname==='/api/settings')
+    || (req.method==='GET' && url.pathname==='/api/users/access')
+    || (req.method==='PUT' && /^\/api\/users\/[^/]+\/access$/.test(url.pathname));
   if(adminOnly&&!isAdmin(req))return send(res,403,{error:'Доступ к настройкам разрешён только администратору'});
   const body = ['POST','PUT','PATCH'].includes(req.method) ? await jsonBody(req) : {};
+  if(req.method==='GET'&&url.pathname==='/api/users/access'){
+    const entities=db.prepare('SELECT id,name FROM legal_entities WHERE enabled=1 ORDER BY id').all().map(row=>({id:Number(row.id),name:row.name}));
+    const users=applicationUsers.filter(user=>user.role!=='admin').map(user=>{
+      const policy=db.prepare('SELECT username FROM user_access_policies WHERE username=?').get(user.username);
+      return{username:user.username,legal_entity_ids:effectiveLegalEntityIds(user),source:policy?'settings':'environment'};
+    });
+    return send(res,200,{users,entities});
+  }
+  const accessMatch=url.pathname.match(/^\/api\/users\/([^/]+)\/access$/);
+  if(req.method==='PUT'&&accessMatch){
+    const username=decodeURIComponent(accessMatch[1]);
+    const user=applicationUsers.find(item=>item.username===username&&item.role!=='admin');
+    if(!user)throw httpError(404,'Пользователь не найден');
+    if(!Array.isArray(body.legal_entity_ids))throw httpError(400,'Передайте список кабинетов');
+    const requested=[...new Set(body.legal_entity_ids.map(Number).filter(id=>Number.isInteger(id)&&id>0))];
+    const existing=db.prepare(`SELECT id FROM legal_entities WHERE enabled=1`).all().map(row=>Number(row.id));
+    const allowed=requested.filter(id=>existing.includes(id));
+    if(allowed.length!==requested.length)throw httpError(400,'Один из выбранных кабинетов не существует');
+    db.prepare(`INSERT INTO user_access_policies(username,legal_entity_ids,updated_at) VALUES(?,?,?)
+      ON CONFLICT(username) DO UPDATE SET legal_entity_ids=excluded.legal_entity_ids,updated_at=excluded.updated_at`)
+      .run(username,JSON.stringify(allowed),now());
+    return send(res,200,{ok:true,username,legal_entity_ids:allowed});
+  }
   if (req.method==='GET' && url.pathname==='/api/legal-entities') return send(res,200,{entities:listLegalEntities(req),active_entity_id:activeEntityId(url,req)});
   if (req.method==='POST' && url.pathname==='/api/legal-entities') {
     const name=String(body.name||'').trim();if(!name)throw new Error('Укажите название юрлица');
@@ -601,7 +627,18 @@ function ensureDefaultLegalEntity(){
   if(!db.prepare('SELECT id FROM legal_entities LIMIT 1').get()){const s=db.prepare('SELECT token_enc FROM settings WHERE id=1').get()||{};db.prepare('INSERT INTO legal_entities(id,name,token_enc,enabled,created_at,updated_at) VALUES(1,?,?,1,?,?)').run('Основное юрлицо',s.token_enc||null,now(),now());}
   const s=db.prepare('SELECT active_entity_id FROM settings WHERE id=1').get();if(!s?.active_entity_id)db.prepare('UPDATE settings SET active_entity_id=1 WHERE id=1').run();
 }
-function permittedEntityIds(req){if(!req)return null;const user=authenticatedUser(req);if(!user)return[];return user.role==='admin'||!Array.isArray(user.legalEntityIds)?null:user.legalEntityIds}
+function effectiveLegalEntityIds(user){
+  if(!user||user.role==='admin')return null;
+  const policy=db.prepare('SELECT legal_entity_ids FROM user_access_policies WHERE username=?').get(user.username);
+  if(policy){
+    try{
+      const ids=JSON.parse(policy.legal_entity_ids);
+      return Array.isArray(ids)?[...new Set(ids.map(Number).filter(id=>Number.isInteger(id)&&id>0))]:[];
+    }catch{return[]}
+  }
+  return Array.isArray(user.legalEntityIds)?user.legalEntityIds:null;
+}
+function permittedEntityIds(req){if(!req)return null;const user=authenticatedUser(req);if(!user)return[];return effectiveLegalEntityIds(user)}
 function requireEntityAccess(req,id){const entityId=Number(id),exists=db.prepare('SELECT id FROM legal_entities WHERE id=? AND enabled=1').get(entityId);if(!exists)throw httpError(404,'Юрлицо не найдено');const allowed=permittedEntityIds(req);if(Array.isArray(allowed)&&!allowed.includes(entityId))throw httpError(403,'Нет доступа к этому юрлицу');return entityId}
 function listLegalEntities(req=null){const rows=db.prepare('SELECT id,name,enabled,token_enc IS NOT NULL AS token_saved,created_at,updated_at FROM legal_entities WHERE enabled=1 ORDER BY id').all().map(x=>({...x,id:Number(x.id)})),allowed=permittedEntityIds(req);return Array.isArray(allowed)?rows.filter(x=>allowed.includes(x.id)):rows}
 function activeEntityId(url,req=null){const requested=Number(url?.searchParams?.get('legal_entity_id'));if(requested)return requireEntityAccess(req,requested);const rows=listLegalEntities(req);if(!rows.length)throw httpError(403,'Пользователю не назначено ни одного юрлица');const preferred=Number(db.prepare('SELECT active_entity_id FROM settings WHERE id=1').get()?.active_entity_id)||1;return rows.some(x=>x.id===preferred)?preferred:rows[0].id}
@@ -640,8 +677,8 @@ function loadApplicationUsers(){
   const raw=String(process.env.ADDITIONAL_USERS_JSON||'').trim();
   if(!raw)return users;
   let extra;
-  try{extra=JSON.parse(raw)}catch{throw new Error('ADDITIONAL_USERS_JSON должен содержать корректный JSON-массив')}
-  if(!Array.isArray(extra))throw new Error('ADDITIONAL_USERS_JSON должен быть JSON-массивом');
+  try{extra=JSON.parse(raw)}catch{console.error('ADDITIONAL_USERS_JSON проигнорирован: указан некорректный JSON-массив');return users}
+  if(!Array.isArray(extra)){console.error('ADDITIONAL_USERS_JSON проигнорирован: значение должно быть JSON-массивом');return users}
   const names=new Set(users.map(user=>user.username));
   for(const item of extra){
     const username=String(item?.username||'').trim(),password=String(item?.password||'');

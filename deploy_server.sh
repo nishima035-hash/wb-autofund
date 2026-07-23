@@ -26,8 +26,13 @@ BACKUP_DIR="${APP_DIR}/backups"
 mkdir -p "${BACKUP_DIR}"
 if ${COMPOSE} ps -q wb-autofund >/dev/null 2>&1 && [[ -n "$(${COMPOSE} ps -q wb-autofund)" ]]; then
   BACKUP_FILE="${BACKUP_DIR}/wb-autofund-$(date +%Y%m%d-%H%M%S).sqlite"
-  ${COMPOSE} exec -T wb-autofund node --input-type=module -e \
-    "import { DatabaseSync } from 'node:sqlite'; const db=new DatabaseSync('/app/data/wb-autofund.sqlite'); db.exec(\"VACUUM INTO '/app/data/predeploy-backup.sqlite'\"); db.close();"
+  if ${COMPOSE} exec -T wb-autofund test -f /app/backup-database.js; then
+    ${COMPOSE} exec -T wb-autofund node backup-database.js \
+      /app/data/wb-autofund.sqlite /app/data/predeploy-backup.sqlite
+  else
+    ${COMPOSE} exec -T wb-autofund node --input-type=module -e \
+      "import { DatabaseSync } from 'node:sqlite'; const db=new DatabaseSync('/app/data/wb-autofund.sqlite'); db.exec(\"PRAGMA wal_checkpoint(FULL); VACUUM INTO '/app/data/predeploy-backup.sqlite'\"); db.close()"
+  fi
   docker cp wb-autofund:/app/data/predeploy-backup.sqlite "${BACKUP_FILE}"
   ${COMPOSE} exec -T wb-autofund node --input-type=module -e \
     "import { unlinkSync } from 'node:fs'; try { unlinkSync('/app/data/predeploy-backup.sqlite') } catch {}"

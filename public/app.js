@@ -82,7 +82,28 @@ async function refreshCurrentEntityView(){
 }
 async function selectLegalEntity(id){if(id===Number(state.active_entity_id))return;selectedLegalEntityId=Number(id);localStorage.setItem('wb-autofund-entity-id',String(selectedLegalEntityId));await load();await refreshCurrentEntityView();toast('Юрлицо выбрано')}
 function applyAccessControl(){const button=document.querySelector('.side[data-page="settingsPage"]'),admin=Boolean(state.current_user?.is_admin);if(button){button.hidden=!admin;button.style.display=admin?'':'none'}const page=$('#settingsPage');if(!admin&&page&&!page.classList.contains('hidden')){page.classList.add('hidden');$('#campaignsPage')?.classList.remove('hidden');document.querySelectorAll('.side').forEach(x=>x.classList.remove('active'));document.querySelector('.side[data-page="campaignsPage"]')?.classList.add('active')}}
-const loadForEntities=load;load=async()=>{state=await requestDashboard();applyAccessControl();viewTabs[1]?.classList.contains('active')?renderRulesList():render();renderLegalEntities()};
+async function loadUserAccess(){
+  const host=$('#userAccessList');
+  if(!host||!state.current_user?.is_admin)return;
+  try{
+    const data=await request('/api/users/access');
+    if(!data.users?.length){host.innerHTML='<p class="muted">Дополнительные пользователи пока не настроены.</p>';return}
+    host.innerHTML=data.users.map(user=>`<section class="user-access-card">
+      <div class="user-access-head"><div><b>${esc(user.username)}</b><small>${user.source==='settings'?'Доступ задан администратором':'Начальный доступ из конфигурации'}</small></div><button type="button" data-save-user-access="${esc(user.username)}">Сохранить доступ</button></div>
+      <div class="entity-access-grid">${data.entities.map(entity=>`<label class="entity-access-option"><input type="checkbox" value="${entity.id}" ${user.legal_entity_ids===null||user.legal_entity_ids.includes(entity.id)?'checked':''}> ${esc(entity.name)}</label>`).join('')}</div>
+    </section>`).join('');
+    host.querySelectorAll('[data-save-user-access]').forEach(button=>button.onclick=()=>saveUserAccess(button.dataset.saveUserAccess,button.closest('.user-access-card')));
+  }catch(error){host.innerHTML=`<p class="warning">${esc(error.message)}</p>`}
+}
+async function saveUserAccess(username,card){
+  const ids=[...card.querySelectorAll('input[type="checkbox"]:checked')].map(input=>Number(input.value));
+  try{
+    await request(`/api/users/${encodeURIComponent(username)}/access`,{method:'PUT',body:JSON.stringify({legal_entity_ids:ids})});
+    toast('Доступ сотрудника сохранён');
+    await loadUserAccess();
+  }catch(error){toast(error.message)}
+}
+const loadForEntities=load;load=async()=>{state=await requestDashboard();applyAccessControl();viewTabs[1]?.classList.contains('active')?renderRulesList():render();renderLegalEntities();await loadUserAccess()};
 if($('#settingsEntity'))$('#settingsEntity').onchange=event=>selectLegalEntity(Number(event.target.value));
 if($('#addEntity'))$('#addEntity').onclick=async()=>{try{const created=await request('/api/legal-entities',{method:'POST',body:JSON.stringify({name:$('#newEntityName').value,token:$('#newEntityToken').value})});selectedLegalEntityId=Number(created.id||selectedLegalEntityId);localStorage.setItem('wb-autofund-entity-id',String(selectedLegalEntityId));$('#newEntityName').value='';$('#newEntityToken').value='';await load();toast('Юрлицо добавлено')}catch(error){toast(error.message)}};
 if($('#saveSettings'))$('#saveSettings').onclick=()=>act('/api/settings',{method:'POST',body:JSON.stringify({legal_entity_id:Number($('#settingsEntity').value),token:$('#token').value,demo_mode:$('#demo').checked,auto_sync_enabled:$('#autoSync').checked,check_minutes:$('#interval').value,stats_days:$('#statsDays').value})},'Настройки сохранены');
