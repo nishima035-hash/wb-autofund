@@ -100,6 +100,10 @@ const server = http.createServer(async (req,res) => {
 
 async function api(req,res,url) {
   if (req.method==='GET' && url.pathname==='/api/health') return send(res,200,{status:'ok',database:'sqlite',time:now()});
+  const adminOnly=(req.method==='POST' && url.pathname==='/api/legal-entities')
+    || (req.method==='PUT' && /^\/api\/legal-entities\/\d+$/.test(url.pathname))
+    || (req.method==='POST' && url.pathname==='/api/settings');
+  if(adminOnly&&!isAdmin(req))return send(res,403,{error:'Доступ к настройкам разрешён только администратору'});
   const body = ['POST','PUT','PATCH'].includes(req.method) ? await jsonBody(req) : {};
   if (req.method==='GET' && url.pathname==='/api/legal-entities') return send(res,200,{entities:listLegalEntities(),active_entity_id:activeEntityId(url)});
   if (req.method==='POST' && url.pathname==='/api/legal-entities') {
@@ -134,7 +138,8 @@ async function api(req,res,url) {
     const activityOperations=db.prepare(`SELECT * FROM operations WHERE legal_entity_id=? AND status IN ('deposited','resumed','paused') ORDER BY id DESC LIMIT 100`).all(entityId);
     const s=db.prepare(`SELECT demo_mode,check_minutes,stats_days,auto_sync_enabled,token_enc IS NOT NULL AS token_saved FROM settings WHERE id=1`).get();
     const entities=listLegalEntities(),entity=entities.find(x=>x.id===entityId);
-    return send(res,200,{campaigns,operations,activity_operations:activityOperations,entities,active_entity_id:entityId,settings:{...s,token_saved:entity?.token_saved||0,display_from:periodFrom||null,display_to:periodTo||null,live_deposits:process.env.WB_LIVE_DEPOSITS==='true',live_resume:process.env.WB_LIVE_RESUME==='true'}});
+    const currentUser=authenticatedUser(req);
+    return send(res,200,{campaigns,operations,activity_operations:activityOperations,entities,active_entity_id:entityId,current_user:{username:currentUser?.username||'',role:currentUser?.role||'user',is_admin:currentUser?.role==='admin'},settings:{...s,token_saved:entity?.token_saved||0,display_from:periodFrom||null,display_to:periodTo||null,live_deposits:process.env.WB_LIVE_DEPOSITS==='true',live_resume:process.env.WB_LIVE_RESUME==='true'}});
   }
     if (req.method==='GET' && url.pathname==='/api/hourly') return send(res,200,hourlyDataWithOrders(url.searchParams.get('campaign_id'),url.searchParams.get('week'),activeEntityId(url)));
   if (req.method==='GET' && url.pathname==='/api/analytics') return send(res,200,analyticsDataV2(url.searchParams.get('from'),url.searchParams.get('to'),url.searchParams.get('campaign_id'),activeEntityId(url)));
@@ -602,9 +607,11 @@ function key(){const raw=process.env.APP_ENCRYPTION_KEY;if(!raw||!/^[a-f0-9]{64}
 function encrypt(s){const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',key(),iv),data=Buffer.concat([c.update(s,'utf8'),c.final()]);return [iv,c.getAuthTag(),data].map(x=>x.toString('base64url')).join('.');}
 function decrypt(s){if(!s)throw new Error('Токен WB не сохранён');const [i,t,d]=s.split('.').map(x=>Buffer.from(x,'base64url'));const c=createDecipheriv('aes-256-gcm',key(),i);c.setAuthTag(t);return Buffer.concat([c.update(d),c.final()]).toString();}
 function loadEnv(){if(!existsSync('.env'))return;for(const line of readFileSync('.env','utf8').split(/\r?\n/)){const m=line.match(/^([^#=]+)=(.*)$/);if(m&&!process.env[m[1].trim()])process.env[m[1].trim()]=m[2].trim();}}
-function authorized(req){const value=req.headers.authorization||'';if(!value.startsWith('Basic '))return false;let decoded='';try{decoded=Buffer.from(value.slice(6),'base64').toString('utf8')}catch{return false}const separator=decoded.indexOf(':');if(separator<0)return false;const username=decoded.slice(0,separator),password=decoded.slice(separator+1);return applicationUsers.some(user=>safeEqual(username,user.username)&&safeEqual(password,user.password));}
+function authenticatedUser(req){const value=req.headers.authorization||'';if(!value.startsWith('Basic '))return null;let decoded='';try{decoded=Buffer.from(value.slice(6),'base64').toString('utf8')}catch{return null}const separator=decoded.indexOf(':');if(separator<0)return null;const username=decoded.slice(0,separator),password=decoded.slice(separator+1);return applicationUsers.find(user=>safeEqual(username,user.username)&&safeEqual(password,user.password))||null;}
+function authorized(req){return Boolean(authenticatedUser(req))}
+function isAdmin(req){return authenticatedUser(req)?.role==='admin'}
 function loadApplicationUsers(){
-  const users=[{username:process.env.ADMIN_USERNAME||'admin',password:process.env.ADMIN_PASSWORD||''}];
+  const users=[{username:process.env.ADMIN_USERNAME||'admin',password:process.env.ADMIN_PASSWORD||'',role:'admin'}];
   const raw=String(process.env.ADDITIONAL_USERS_JSON||'').trim();
   if(!raw)return users;
   let extra;
@@ -615,7 +622,7 @@ function loadApplicationUsers(){
     const username=String(item?.username||'').trim(),password=String(item?.password||'');
     if(!username||!password)throw new Error('У каждого дополнительного пользователя должны быть username и password');
     if(names.has(username))throw new Error(`Логин пользователя повторяется: ${username}`);
-    names.add(username);users.push({username,password});
+    names.add(username);users.push({username,password,role:'user'});
   }
   return users;
 }
