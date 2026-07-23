@@ -87,12 +87,16 @@ async function loadUserAccess(){
   if(!host||!state.current_user?.is_admin)return;
   try{
     const data=await request('/api/users/access');
-    if(!data.users?.length){host.innerHTML='<p class="muted">Дополнительные пользователи пока не настроены.</p>';return}
+    state.user_access_entities=data.entities||[];
+    const createAccess=$('#newUserEntityAccess');
+    if(createAccess)createAccess.innerHTML=state.user_access_entities.map(entity=>`<label class="entity-access-option"><input type="checkbox" value="${entity.id}" checked> ${esc(entity.name)}</label>`).join('');
+    if(!data.users?.length){host.innerHTML='<p class="muted">Сотрудники пока не добавлены.</p>';return}
     host.innerHTML=data.users.map(user=>`<section class="user-access-card">
-      <div class="user-access-head"><div><b>${esc(user.username)}</b><small>${user.source==='settings'?'Доступ задан администратором':'Начальный доступ из конфигурации'}</small></div><button type="button" data-save-user-access="${esc(user.username)}">Сохранить доступ</button></div>
+      <div class="user-access-head"><div><b>${esc(user.username)}</b><small>${user.managed?'Создан в настройках сайта':'Добавлен в конфигурации сервера'}</small></div><div class="user-access-actions"><button type="button" data-save-user-access="${esc(user.username)}">Сохранить доступ</button>${user.managed?`<button type="button" class="danger" data-delete-user="${esc(user.username)}">Удалить</button>`:''}</div></div>
       <div class="entity-access-grid">${data.entities.map(entity=>`<label class="entity-access-option"><input type="checkbox" value="${entity.id}" ${user.legal_entity_ids===null||user.legal_entity_ids.includes(entity.id)?'checked':''}> ${esc(entity.name)}</label>`).join('')}</div>
     </section>`).join('');
     host.querySelectorAll('[data-save-user-access]').forEach(button=>button.onclick=()=>saveUserAccess(button.dataset.saveUserAccess,button.closest('.user-access-card')));
+    host.querySelectorAll('[data-delete-user]').forEach(button=>button.onclick=()=>deleteUser(button.dataset.deleteUser));
   }catch(error){host.innerHTML=`<p class="warning">${esc(error.message)}</p>`}
 }
 async function saveUserAccess(username,card){
@@ -103,9 +107,24 @@ async function saveUserAccess(username,card){
     await loadUserAccess();
   }catch(error){toast(error.message)}
 }
+async function addUser(){
+  const username=$('#newUserName')?.value.trim()||'',password=$('#newUserPassword')?.value||'';
+  const legalEntityIds=[...document.querySelectorAll('#newUserEntityAccess input:checked')].map(input=>Number(input.value));
+  try{
+    await request('/api/users',{method:'POST',body:JSON.stringify({username,password,legal_entity_ids:legalEntityIds})});
+    $('#newUserName').value='';$('#newUserPassword').value='';
+    toast('Сотрудник добавлен');await loadUserAccess();
+  }catch(error){toast(error.message)}
+}
+async function deleteUser(username){
+  if(!confirm(`Удалить сотрудника ${username}?`))return;
+  try{await request(`/api/users/${encodeURIComponent(username)}`,{method:'DELETE'});toast('Сотрудник удалён');await loadUserAccess()}
+  catch(error){toast(error.message)}
+}
 const loadForEntities=load;load=async()=>{state=await requestDashboard();applyAccessControl();viewTabs[1]?.classList.contains('active')?renderRulesList():render();renderLegalEntities();await loadUserAccess()};
 if($('#settingsEntity'))$('#settingsEntity').onchange=event=>selectLegalEntity(Number(event.target.value));
 if($('#addEntity'))$('#addEntity').onclick=async()=>{try{const created=await request('/api/legal-entities',{method:'POST',body:JSON.stringify({name:$('#newEntityName').value,token:$('#newEntityToken').value})});selectedLegalEntityId=Number(created.id||selectedLegalEntityId);localStorage.setItem('wb-autofund-entity-id',String(selectedLegalEntityId));$('#newEntityName').value='';$('#newEntityToken').value='';await load();toast('Юрлицо добавлено')}catch(error){toast(error.message)}};
+if($('#addUser'))$('#addUser').onclick=addUser;
 if($('#saveSettings'))$('#saveSettings').onclick=()=>act('/api/settings',{method:'POST',body:JSON.stringify({legal_entity_id:Number($('#settingsEntity').value),token:$('#token').value,demo_mode:$('#demo').checked,auto_sync_enabled:$('#autoSync').checked,check_minutes:$('#interval').value,stats_days:$('#statsDays').value})},'Настройки сохранены');
 function addApiScopeBadges(input){
   const label=input?.closest('label');if(!label||label.querySelector('.api-scope-row'))return;

@@ -2,7 +2,7 @@ import http from 'node:http';
 import { readFileSync, existsSync, mkdirSync } from 'node:fs';
 import { extname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { createCipheriv, createDecipheriv, randomBytes, createHash, timingSafeEqual } from 'node:crypto';
+import { createCipheriv, createDecipheriv, randomBytes, createHash, timingSafeEqual, scryptSync } from 'node:crypto';
 
 loadEnv();
 const PORT = Number(process.env.PORT || 4173);
@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS campaign_bid_changes (changed_at TEXT NOT NULL, campa
 CREATE TABLE IF NOT EXISTS supplier_orders (legal_entity_id INTEGER NOT NULL, srid TEXT NOT NULL, order_date TEXT NOT NULL, last_change_date TEXT, nm_id TEXT, supplier_article TEXT, total_price REAL, finished_price REAL, is_cancel INTEGER NOT NULL DEFAULT 0, cancel_date TEXT, updated_at TEXT NOT NULL, PRIMARY KEY(legal_entity_id,srid));
 CREATE TABLE IF NOT EXISTS entity_sync_state (legal_entity_id INTEGER PRIMARY KEY, orders_last_change TEXT, orders_last_sync_at TEXT, orders_last_error TEXT);
 CREATE TABLE IF NOT EXISTS user_access_policies (username TEXT PRIMARY KEY, legal_entity_ids TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS managed_users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_supplier_orders_entity_date_nm ON supplier_orders(legal_entity_id,order_date,nm_id);
 INSERT OR IGNORE INTO settings(id,demo_mode,check_minutes,updated_at) VALUES(1,1,5,datetime('now'));`);
 migrateColumn('rules','use_max_drr','INTEGER NOT NULL DEFAULT 1');
@@ -113,21 +114,46 @@ async function api(req,res,url) {
     || (req.method==='PUT' && /^\/api\/legal-entities\/\d+$/.test(url.pathname))
     || (req.method==='POST' && url.pathname==='/api/settings')
     || (req.method==='GET' && url.pathname==='/api/users/access')
+    || (req.method==='POST' && url.pathname==='/api/users')
+    || (req.method==='DELETE' && /^\/api\/users\/[^/]+$/.test(url.pathname))
     || (req.method==='PUT' && /^\/api\/users\/[^/]+\/access$/.test(url.pathname));
   if(adminOnly&&!isAdmin(req))return send(res,403,{error:'Доступ к настройкам разрешён только администратору'});
   const body = ['POST','PUT','PATCH'].includes(req.method) ? await jsonBody(req) : {};
   if(req.method==='GET'&&url.pathname==='/api/users/access'){
     const entities=db.prepare('SELECT id,name FROM legal_entities WHERE enabled=1 ORDER BY id').all().map(row=>({id:Number(row.id),name:row.name}));
-    const users=applicationUsers.filter(user=>user.role!=='admin').map(user=>{
+    const users=allApplicationUsers().filter(user=>user.role!=='admin').map(user=>{
       const policy=db.prepare('SELECT username FROM user_access_policies WHERE username=?').get(user.username);
-      return{username:user.username,legal_entity_ids:effectiveLegalEntityIds(user),source:policy?'settings':'environment'};
+      return{username:user.username,legal_entity_ids:effectiveLegalEntityIds(user),source:policy?'settings':user.source,managed:Boolean(user.managed)};
     });
     return send(res,200,{users,entities});
+  }
+  if(req.method==='POST'&&url.pathname==='/api/users'){
+    const username=String(body.username||'').trim(),password=String(body.password||'');
+    if(!/^[A-Za-z0-9._@-]{3,64}$/.test(username))throw httpError(400,'Логин: 3–64 символа, латиница, цифры, точка, дефис или подчёркивание');
+    if(password.length<12)throw httpError(400,'Пароль должен содержать не менее 12 символов');
+    if(allApplicationUsers().some(user=>user.username===username))throw httpError(409,'Пользователь с таким логином уже существует');
+    if(!Array.isArray(body.legal_entity_ids))throw httpError(400,'Выберите кабинеты сотрудника');
+    const requested=[...new Set(body.legal_entity_ids.map(Number).filter(id=>Number.isInteger(id)&&id>0))];
+    const existing=db.prepare('SELECT id FROM legal_entities WHERE enabled=1').all().map(row=>Number(row.id));
+    if(requested.some(id=>!existing.includes(id)))throw httpError(400,'Один из выбранных кабинетов не существует');
+    const created=now();
+    db.prepare('INSERT INTO managed_users(username,password_hash,role,enabled,created_at,updated_at) VALUES(?,?,?,1,?,?)').run(username,hashUserPassword(password),'user',created,created);
+    db.prepare('INSERT INTO user_access_policies(username,legal_entity_ids,updated_at) VALUES(?,?,?)').run(username,JSON.stringify(requested),created);
+    return send(res,201,{ok:true,username});
+  }
+  const userMatch=url.pathname.match(/^\/api\/users\/([^/]+)$/);
+  if(req.method==='DELETE'&&userMatch){
+    const username=decodeURIComponent(userMatch[1]);
+    const managed=db.prepare('SELECT username FROM managed_users WHERE username=?').get(username);
+    if(!managed)throw httpError(404,'Удалить можно только сотрудника, созданного в настройках');
+    db.prepare('DELETE FROM user_access_policies WHERE username=?').run(username);
+    db.prepare('DELETE FROM managed_users WHERE username=?').run(username);
+    return send(res,200,{ok:true});
   }
   const accessMatch=url.pathname.match(/^\/api\/users\/([^/]+)\/access$/);
   if(req.method==='PUT'&&accessMatch){
     const username=decodeURIComponent(accessMatch[1]);
-    const user=applicationUsers.find(item=>item.username===username&&item.role!=='admin');
+    const user=allApplicationUsers().find(item=>item.username===username&&item.role!=='admin');
     if(!user)throw httpError(404,'Пользователь не найден');
     if(!Array.isArray(body.legal_entity_ids))throw httpError(400,'Передайте список кабинетов');
     const requested=[...new Set(body.legal_entity_ids.map(Number).filter(id=>Number.isInteger(id)&&id>0))];
@@ -656,7 +682,7 @@ function key(){const raw=process.env.APP_ENCRYPTION_KEY;if(!raw||!/^[a-f0-9]{64}
 function encrypt(s){const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',key(),iv),data=Buffer.concat([c.update(s,'utf8'),c.final()]);return [iv,c.getAuthTag(),data].map(x=>x.toString('base64url')).join('.');}
 function decrypt(s){if(!s)throw new Error('Токен WB не сохранён');const [i,t,d]=s.split('.').map(x=>Buffer.from(x,'base64url'));const c=createDecipheriv('aes-256-gcm',key(),i);c.setAuthTag(t);return Buffer.concat([c.update(d),c.final()]).toString();}
 function loadEnv(){if(!existsSync('.env'))return;for(const line of readFileSync('.env','utf8').split(/\r?\n/)){const m=line.match(/^([^#=]+)=(.*)$/);if(m&&!process.env[m[1].trim()])process.env[m[1].trim()]=m[2].trim();}}
-function authenticatedUser(req){const value=req.headers.authorization||'';if(!value.startsWith('Basic '))return null;let decoded='';try{decoded=Buffer.from(value.slice(6),'base64').toString('utf8')}catch{return null}const separator=decoded.indexOf(':');if(separator<0)return null;const username=decoded.slice(0,separator),password=decoded.slice(separator+1);return applicationUsers.find(user=>safeEqual(username,user.username)&&safeEqual(password,user.password))||null;}
+function authenticatedUser(req){const value=req.headers.authorization||'';if(!value.startsWith('Basic '))return null;let decoded='';try{decoded=Buffer.from(value.slice(6),'base64').toString('utf8')}catch{return null}const separator=decoded.indexOf(':');if(separator<0)return null;const username=decoded.slice(0,separator),password=decoded.slice(separator+1);return allApplicationUsers().find(user=>safeEqual(username,user.username)&&(user.passwordHash?verifyUserPassword(password,user.passwordHash):safeEqual(password,user.password)))||null;}
 function authorizeRequest(req){
   const address=String(req.headers['x-forwarded-for']||req.socket?.remoteAddress||'unknown').split(',')[0].trim();
   const current=Date.now(),previous=authAttempts.get(address);
@@ -689,6 +715,17 @@ function loadApplicationUsers(){
   }
   return users;
 }
+function allApplicationUsers(){
+  const users=applicationUsers.map(user=>({...user,source:'environment',managed:false}));
+  const names=new Set(users.map(user=>user.username));
+  for(const row of db.prepare("SELECT username,password_hash,role FROM managed_users WHERE enabled=1 ORDER BY username").all()){
+    if(names.has(row.username))continue;
+    users.push({username:row.username,passwordHash:row.password_hash,role:row.role||'user',legalEntityIds:null,source:'settings',managed:true});
+  }
+  return users;
+}
+function hashUserPassword(password){const salt=randomBytes(16);const hash=scryptSync(String(password),salt,64);return `scrypt$${salt.toString('base64url')}$${hash.toString('base64url')}`}
+function verifyUserPassword(password,stored){try{const [,salt,expected]=String(stored).split('$');const expectedBuffer=Buffer.from(expected,'base64url');const actual=scryptSync(String(password),Buffer.from(salt,'base64url'),expectedBuffer.length);return timingSafeEqual(actual,expectedBuffer)}catch{return false}}
 function safeEqual(a,b){return timingSafeEqual(createHash('sha256').update(String(a)).digest(),createHash('sha256').update(String(b)).digest());}
 function now(){return new Date().toISOString()} function positive(v){v=Number(v);if(!Number.isFinite(v)||v<0)throw new Error('Поля правила должны быть неотрицательными');return v} function clamp(v,a,b){return Math.max(a,Math.min(b,Math.round(Number(v)||a)))}
 function send(res,status,data){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data))} async function jsonBody(req){let s='';for await(const c of req){s+=c;if(s.length>1e6)throw new Error('Слишком большой запрос')}return s?JSON.parse(s):{}}
