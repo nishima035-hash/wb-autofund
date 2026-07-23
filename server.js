@@ -10,6 +10,8 @@ const HOST = process.env.HOST || '0.0.0.0';
 const isProduction = process.env.NODE_ENV === 'production';
 if (isProduction && !/^[a-f0-9]{64}$/i.test(process.env.APP_ENCRYPTION_KEY || '')) throw new Error('В production задайте APP_ENCRYPTION_KEY: ровно 64 hex-символа');
 if (isProduction && String(process.env.ADMIN_PASSWORD || '').length < 12) throw new Error('В production задайте ADMIN_PASSWORD длиной не менее 12 символов');
+const applicationUsers = loadApplicationUsers();
+if (isProduction && applicationUsers.some(user => user.password.length < 12)) throw new Error('Пароль каждого дополнительного пользователя должен содержать не менее 12 символов');
 const DATA = join(process.cwd(), 'data');
 mkdirSync(DATA, { recursive: true });
 const db = new DatabaseSync(join(DATA, 'wb-autofund.sqlite'));
@@ -508,7 +510,23 @@ function key(){const raw=process.env.APP_ENCRYPTION_KEY;if(!raw||!/^[a-f0-9]{64}
 function encrypt(s){const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',key(),iv),data=Buffer.concat([c.update(s,'utf8'),c.final()]);return [iv,c.getAuthTag(),data].map(x=>x.toString('base64url')).join('.');}
 function decrypt(s){if(!s)throw new Error('Токен WB не сохранён');const [i,t,d]=s.split('.').map(x=>Buffer.from(x,'base64url'));const c=createDecipheriv('aes-256-gcm',key(),i);c.setAuthTag(t);return Buffer.concat([c.update(d),c.final()]).toString();}
 function loadEnv(){if(!existsSync('.env'))return;for(const line of readFileSync('.env','utf8').split(/\r?\n/)){const m=line.match(/^([^#=]+)=(.*)$/);if(m&&!process.env[m[1].trim()])process.env[m[1].trim()]=m[2].trim();}}
-function authorized(req){const value=req.headers.authorization||'';if(!value.startsWith('Basic '))return false;let decoded='';try{decoded=Buffer.from(value.slice(6),'base64').toString('utf8')}catch{return false}const separator=decoded.indexOf(':');if(separator<0)return false;const username=decoded.slice(0,separator),password=decoded.slice(separator+1);return safeEqual(username,process.env.ADMIN_USERNAME||'admin')&&safeEqual(password,process.env.ADMIN_PASSWORD||'');}
+function authorized(req){const value=req.headers.authorization||'';if(!value.startsWith('Basic '))return false;let decoded='';try{decoded=Buffer.from(value.slice(6),'base64').toString('utf8')}catch{return false}const separator=decoded.indexOf(':');if(separator<0)return false;const username=decoded.slice(0,separator),password=decoded.slice(separator+1);return applicationUsers.some(user=>safeEqual(username,user.username)&&safeEqual(password,user.password));}
+function loadApplicationUsers(){
+  const users=[{username:process.env.ADMIN_USERNAME||'admin',password:process.env.ADMIN_PASSWORD||''}];
+  const raw=String(process.env.ADDITIONAL_USERS_JSON||'').trim();
+  if(!raw)return users;
+  let extra;
+  try{extra=JSON.parse(raw)}catch{throw new Error('ADDITIONAL_USERS_JSON должен содержать корректный JSON-массив')}
+  if(!Array.isArray(extra))throw new Error('ADDITIONAL_USERS_JSON должен быть JSON-массивом');
+  const names=new Set(users.map(user=>user.username));
+  for(const item of extra){
+    const username=String(item?.username||'').trim(),password=String(item?.password||'');
+    if(!username||!password)throw new Error('У каждого дополнительного пользователя должны быть username и password');
+    if(names.has(username))throw new Error(`Логин пользователя повторяется: ${username}`);
+    names.add(username);users.push({username,password});
+  }
+  return users;
+}
 function safeEqual(a,b){return timingSafeEqual(createHash('sha256').update(String(a)).digest(),createHash('sha256').update(String(b)).digest());}
 function now(){return new Date().toISOString()} function positive(v){v=Number(v);if(!Number.isFinite(v)||v<0)throw new Error('Поля правила должны быть неотрицательными');return v} function clamp(v,a,b){return Math.max(a,Math.min(b,Math.round(Number(v)||a)))}
 function send(res,status,data){res.writeHead(status,{'content-type':'application/json; charset=utf-8','cache-control':'no-store'});res.end(JSON.stringify(data))} async function jsonBody(req){let s='';for await(const c of req){s+=c;if(s.length>1e6)throw new Error('Слишком большой запрос')}return s?JSON.parse(s):{}}
