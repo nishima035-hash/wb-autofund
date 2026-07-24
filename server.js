@@ -170,6 +170,19 @@ async function api(req,res,url) {
     return send(res,200,{ok:true,username,legal_entity_ids:allowed});
   }
   if (req.method==='GET' && url.pathname==='/api/legal-entities') return send(res,200,{entities:listLegalEntities(req),active_entity_id:activeEntityId(url,req)});
+  if (req.method==='GET' && url.pathname==='/api/legal-entities/resolve') {
+    const campaignIds=[...new Set(String(url.searchParams.get('campaign_ids')||'').split(',').map(Number).filter(id=>Number.isInteger(id)&&id>0))].slice(0,200);
+    if(!campaignIds.length)return send(res,200,{entity_id:null,matched_campaign_ids:[],matches:[]});
+    const allowed=listLegalEntities(req).map(entity=>entity.id);
+    if(!allowed.length)return send(res,200,{entity_id:null,matched_campaign_ids:[],matches:[]});
+    const campaignPlaceholders=campaignIds.map(()=>'?').join(','),entityPlaceholders=allowed.map(()=>'?').join(',');
+    const rows=db.prepare(`SELECT legal_entity_id entity_id,id campaign_id FROM campaigns WHERE status<>'archived' AND id IN (${campaignPlaceholders}) AND legal_entity_id IN (${entityPlaceholders}) ORDER BY legal_entity_id,id`).all(...campaignIds,...allowed);
+    const grouped=new Map();
+    for(const row of rows){const id=Number(row.entity_id);if(!grouped.has(id))grouped.set(id,[]);grouped.get(id).push(Number(row.campaign_id));}
+    const matches=[...grouped].map(([entity_id,ids])=>({entity_id,match_count:ids.length,campaign_ids:ids})).sort((a,b)=>b.match_count-a.match_count||a.entity_id-b.entity_id);
+    const winner=matches[0]&&(!matches[1]||matches[0].match_count>matches[1].match_count)?matches[0]:null;
+    return send(res,200,{entity_id:winner?.entity_id||null,matched_campaign_ids:winner?.campaign_ids||[],matches});
+  }
   if (req.method==='POST' && url.pathname==='/api/legal-entities') {
     const name=String(body.name||'').trim();if(!name)throw new Error('Укажите название юрлица');
     const token=String(body.token||'').trim();if(!token)throw new Error('Укажите API-токен WB');

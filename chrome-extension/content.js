@@ -5,7 +5,7 @@
   panel.innerHTML='<header><div><b>WB AutoFund</b><small>Автопополнение кампаний</small></div><select id="wba-entity" title="Юрлицо"></select><button id="wba-close">×</button></header><div id="wba-body" class="wba-message">Откройте панель</div>';
   document.documentElement.append(btn,panel);
   panel.querySelector('#wba-entity').style.cssText='width:155px;max-width:38%;padding:8px;border:1px solid #ddd;border-radius:8px;background:#fff;font:600 12px Arial;color:#302a37';
-  let displayDays=7,selectedEntityId=0,loadedCampaigns=[],activeView='campaigns',badgeTimer=null,loadGeneration=0;chrome.storage.local.get({displayDays:7,selectedEntityId:0},value=>{displayDays=Number(value.displayDays)||7;selectedEntityId=Number(value.selectedEntityId)||0;setTimeout(load,100)});
+  let displayDays=7,selectedEntityId=0,loadedCampaigns=[],activeView='campaigns',badgeTimer=null,loadGeneration=0,manualEntityOverride=false;chrome.storage.local.get({displayDays:7,selectedEntityId:0},value=>{displayDays=Number(value.displayDays)||7;selectedEntityId=Number(value.selectedEntityId)||0;setTimeout(load,100)});
   const toggle=()=>{panel.classList.toggle('open');if(panel.classList.contains('open'))load()};
   btn.onclick=toggle;panel.querySelector('#wba-close').onclick=toggle;
   const refreshIfIdle=()=>{if(panel.classList.contains('open')&&!panel.querySelector('.wba-form.open'))load()};
@@ -16,14 +16,30 @@
     if(!match)return null;
     return{from:`${match[3]}-${match[2]}-${match[1]}`,to:`${match[6]}-${match[5]}-${match[4]}`};
   }
+  function visibleCampaignIds(){
+    return globalThis.WBAContext.extractCampaignIdsFromText(document.body?.innerText||'').slice(0,200);
+  }
+  async function detectEntity(campaignIds){
+    const ids=globalThis.WBAContext.normalizeCampaignIds(campaignIds);
+    if(!ids.length)return null;
+    const result=await chrome.runtime.sendMessage({type:'api',path:`/api/legal-entities/resolve?campaign_ids=${encodeURIComponent(ids.join(','))}`});
+    return result?.ok?result.data:null;
+  }
   async function load(openCampaignId=null){
     const generation=++loadGeneration;
+    if(openCampaignId||!manualEntityOverride){
+      try{
+        const detected=await detectEntity(openCampaignId?[openCampaignId]:visibleCampaignIds());
+        if(generation!==loadGeneration)return;
+        if(detected?.entity_id)selectedEntityId=Number(detected.entity_id);
+      }catch{}
+    }
     const body=panel.querySelector('#wba-body');body.className='wba-message';body.textContent='Загрузка…';
     let r;try{r=await chrome.runtime.sendMessage({type:'api',path:`/api/dashboard?days=${displayDays}${selectedEntityId?`&legal_entity_id=${selectedEntityId}`:''}`})}catch(error){body.textContent=error.message||'Не удалось связаться с расширением';return}
     if(generation!==loadGeneration)return;
     if(!r?.ok){body.textContent=r?.error||'Настройте подключение через значок расширения';return}
     loadedCampaigns=r.data.campaigns||[];
-    const entitySelect=panel.querySelector('#wba-entity'),entities=r.data.entities||[];selectedEntityId=Number(r.data.active_entity_id||selectedEntityId||entities[0]?.id||0);entitySelect.innerHTML=entities.map(entity=>`<option value="${entity.id}">${esc(entity.name)}</option>`).join('');entitySelect.value=String(selectedEntityId);entitySelect.onchange=()=>{selectedEntityId=Number(entitySelect.value);chrome.storage.local.set({selectedEntityId});load()};
+    const entitySelect=panel.querySelector('#wba-entity'),entities=r.data.entities||[];selectedEntityId=Number(r.data.active_entity_id||selectedEntityId||entities[0]?.id||0);entitySelect.innerHTML=entities.map(entity=>`<option value="${entity.id}">${esc(entity.name)}</option>`).join('');entitySelect.value=String(selectedEntityId);entitySelect.title='Юрлицо определяется автоматически по ID кампаний. Можно выбрать вручную.';entitySelect.onchange=()=>{manualEntityOverride=true;selectedEntityId=Number(entitySelect.value);chrome.storage.local.set({selectedEntityId});load()};
     body.className='';body.innerHTML='<div class="wba-tabs"><button data-view="campaigns">Кампании</button><button data-view="journal">Журнал</button></div><div class="wba-campaign-view"><div class="wba-search"><input type="search" placeholder="Поиск по названию или ID"><select><option value="all">Все кампании</option><option value="enabled">Автопополнение включено</option><option value="setup">Нужно настроить</option></select><small></small></div><div class="wba-cards"></div></div><div class="wba-journal-view"></div>';
     const campaignView=body.querySelector('.wba-campaign-view'),journalView=body.querySelector('.wba-journal-view');const period=document.createElement('label');period.className='wba-period';period.style.cssText='display:flex;flex-direction:column;gap:5px;margin-bottom:10px;color:#777;font-size:11px';period.innerHTML=`Период отображения CTR и ДРР<select><option value="1">Сегодня</option><option value="3">3 дня</option><option value="7">7 дней</option><option value="14">14 дней</option><option value="30">30 дней</option></select>`;const periodSelect=period.querySelector('select');periodSelect.style.cssText='padding:9px;border:1px solid #ddd;border-radius:8px;background:white';periodSelect.value=String(displayDays);periodSelect.onchange=()=>{displayDays=Number(periodSelect.value);chrome.storage.local.set({displayDays});load()};campaignView.prepend(period);
     const input=campaignView.querySelector('.wba-search input'),filter=campaignView.querySelector('.wba-search select'),cards=campaignView.querySelector('.wba-cards'),count=campaignView.querySelector('.wba-search small');
