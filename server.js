@@ -97,7 +97,11 @@ const server = http.createServer(async (req,res) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (url.pathname!=='/api/health' && isProduction) {
       const authState=authorizeRequest(req);
-      if(authState.blocked)return send(res,429,{error:'Слишком много неудачных попыток входа. Повторите через 15 минут'});
+if(authState.blocked){
+  const retryAfter=authState.retryAfter||Math.ceil(AUTH_WINDOW_MS/1000);
+  res.setHeader('Retry-After',String(retryAfter));
+  return send(res,429,{error:`Слишком много неудачных попыток входа. Повторите через ${Math.max(1,Math.ceil(retryAfter/60))} мин.`});
+}
       if(!authState.user){res.writeHead(401,{'www-authenticate':'Basic realm="WB AutoFund", charset="UTF-8"','content-type':'text/plain; charset=utf-8','cache-control':'no-store'});return res.end('Требуется вход')}
     }
     if (url.pathname.startsWith('/api/')) return await api(req,res,url);
@@ -715,16 +719,34 @@ function encrypt(s){const iv=randomBytes(12),c=createCipheriv('aes-256-gcm',key(
 function decrypt(s){if(!s)throw new Error('Токен WB не сохранён');const [i,t,d]=s.split('.').map(x=>Buffer.from(x,'base64url'));const c=createDecipheriv('aes-256-gcm',key(),i);c.setAuthTag(t);return Buffer.concat([c.update(d),c.final()]).toString();}
 function loadEnv(){if(!existsSync('.env'))return;for(const line of readFileSync('.env','utf8').split(/\r?\n/)){const m=line.match(/^([^#=]+)=(.*)$/);if(m&&!process.env[m[1].trim()])process.env[m[1].trim()]=m[2].trim();}}
 function authenticatedUser(req){const value=req.headers.authorization||'';if(!value.startsWith('Basic '))return null;let decoded='';try{decoded=Buffer.from(value.slice(6),'base64').toString('utf8')}catch{return null}const separator=decoded.indexOf(':');if(separator<0)return null;const username=decoded.slice(0,separator),password=decoded.slice(separator+1);return allApplicationUsers().find(user=>safeEqual(username,user.username)&&(user.passwordHash?verifyUserPassword(password,user.passwordHash):safeEqual(password,user.password)))||null;}
+function basicAuthUsername(req){
+  const value=req.headers.authorization||'';
+  if(!value.startsWith('Basic '))return '';
+  try{
+    const decoded=Buffer.from(value.slice(6),'base64').toString('utf8');
+    const separator=decoded.indexOf(':');
+    return separator<0?'':decoded.slice(0,separator).trim().toLowerCase();
+  }catch{return ''}
+}
 function authorizeRequest(req){
   const address=String(req.headers['x-forwarded-for']||req.socket?.remoteAddress||'unknown').split(',')[0].trim();
-  const current=Date.now(),previous=authAttempts.get(address);
-  if(previous&&current-previous.startedAt<AUTH_WINDOW_MS&&previous.failures>=AUTH_MAX_FAILURES)return{user:null,blocked:true};
-  if(previous&&current-previous.startedAt>=AUTH_WINDOW_MS)authAttempts.delete(address);
+  const username=basicAuthUsername(req)||'<unknown>';
+  const key=`${address}\n${username}`;
+  const current=Date.now();
   const user=authenticatedUser(req);
-  if(user){authAttempts.delete(address);return{user,blocked:false}}
-  const state=authAttempts.get(address);
-  authAttempts.set(address,state?{startedAt:state.startedAt,failures:state.failures+1}:{startedAt:current,failures:1});
-  return{user:null,blocked:false};
+  if(user){authAttempts.delete(key);return{user,blocked:false,retryAfter:0}}
+  const previous=authAttempts.get(key);
+  if(previous&&current-previous.startedAt>=AUTH_WINDOW_MS)authAttempts.delete(key);
+  const active=authAttempts.get(key);
+  if(active&&active.failures>=AUTH_MAX_FAILURES){
+    return{
+      user:null,
+      blocked:true,
+      retryAfter:Math.max(1,Math.ceil((AUTH_WINDOW_MS-(current-active.startedAt))/1000))
+    };
+  }
+  authAttempts.set(key,active?{startedAt:active.startedAt,failures:active.failures+1}:{startedAt:current,failures:1});
+  return{user:null,blocked:false,retryAfter:0};
 }
 function authorized(req){return Boolean(authenticatedUser(req))}
 function isAdmin(req){return authenticatedUser(req)?.role==='admin'}
