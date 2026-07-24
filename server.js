@@ -169,14 +169,17 @@ async function api(req,res,url) {
   if (req.method==='POST' && url.pathname==='/api/legal-entities') {
     const name=String(body.name||'').trim();if(!name)throw new Error('Укажите название юрлица');
     const token=String(body.token||'').trim();if(!token)throw new Error('Укажите API-токен WB');
+    const tokenInfo=inspectWbToken(token);
     const result=db.prepare('INSERT INTO legal_entities(name,token_enc,enabled,created_at,updated_at) VALUES(?,?,1,?,?)').run(name,encrypt(token),now(),now());
-    return send(res,201,{ok:true,id:Number(result.lastInsertRowid)});
+    return send(res,201,{ok:true,id:Number(result.lastInsertRowid),token_sections:tokenInfo.sections,token_read_only:tokenInfo.read_only});
   }
   const entityMatch=url.pathname.match(/^\/api\/legal-entities\/(\d+)$/);
   if (req.method==='PUT' && entityMatch) {
     const id=Number(entityMatch[1]),current=db.prepare('SELECT * FROM legal_entities WHERE id=?').get(id);if(!current)throw new Error('Юрлицо не найдено');
     const name=String(body.name??current.name).trim();if(!name)throw new Error('Укажите название юрлица');
-    const token=String(body.token||'').trim()?encrypt(String(body.token).trim()):current.token_enc;
+    const replacementToken=String(body.token||'').trim();
+    if(replacementToken)inspectWbToken(replacementToken);
+    const token=replacementToken?encrypt(replacementToken):current.token_enc;
     db.prepare('UPDATE legal_entities SET name=?,token_enc=?,enabled=?,updated_at=? WHERE id=?').run(name,token,body.enabled===false?0:1,now(),id);return send(res,200,{ok:true});
   }
   if (req.method==='POST' && url.pathname==='/api/legal-entities/select') {
@@ -206,9 +209,12 @@ async function api(req,res,url) {
   if (req.method==='POST' && url.pathname==='/api/settings') {
     const current=db.prepare('SELECT * FROM settings WHERE id=1').get();
     const entityId=Number(body.legal_entity_id)||Number(current.active_entity_id)||1;
-    if(typeof body.token==='string'&&body.token.trim())db.prepare('UPDATE legal_entities SET token_enc=?,updated_at=? WHERE id=?').run(encrypt(body.token.trim()),now(),entityId);
+    requireEntityAccess(req,entityId);
+    const replacementToken=typeof body.token==='string'?body.token.trim():'';
+    const tokenInfo=replacementToken?inspectWbToken(replacementToken):null;
+    if(replacementToken)db.prepare('UPDATE legal_entities SET token_enc=?,updated_at=? WHERE id=?').run(encrypt(replacementToken),now(),entityId);
     db.prepare('UPDATE settings SET active_entity_id=?,demo_mode=?,check_minutes=?,stats_days=?,auto_sync_enabled=?,updated_at=? WHERE id=1').run(entityId,body.demo_mode?1:0,clamp(body.check_minutes,1,1440),clamp(body.stats_days ?? current.stats_days ?? 7,1,31),body.auto_sync_enabled===false?0:1,now());
-    return send(res,200,{ok:true});
+    return send(res,200,{ok:true,token_replaced:Boolean(replacementToken),token_sections:tokenInfo?.sections||null,token_read_only:tokenInfo?.read_only||false});
   }
   const ruleMatch=url.pathname.match(/^\/api\/campaigns\/(\d+)\/rule$/);
   if (req.method==='PUT' && ruleMatch) {
@@ -639,7 +645,10 @@ function analyticsDataV2(from,to,campaignId,entityId=1){
   const stats=db.prepare(`SELECT d.campaign_id,SUM(d.views) views,SUM(d.clicks) clicks,SUM(d.orders) orders,SUM(d.spend) spend,SUM(d.revenue) revenue,CASE WHEN SUM(d.views)>0 THEN SUM(d.clicks)*100.0/SUM(d.views) ELSE 0 END ctr,CASE WHEN SUM(d.revenue)>0 THEN SUM(d.spend)*100.0/SUM(d.revenue) ELSE 0 END drr FROM campaign_daily_stats d JOIN campaigns c ON c.id=d.campaign_id WHERE d.legal_entity_id=? AND d.stat_date BETWEEN ? AND ? AND c.status<>'archived' GROUP BY d.campaign_id`).all(entityId,start,end);
   const rows=stats.map(s=>{const c=db.prepare(`SELECT name,status FROM campaigns WHERE id=?`).get(s.campaign_id)||{},b=db.prepare(`SELECT COUNT(DISTINCT nm_id) products,MIN(bid_rub) bid_min,MAX(bid_rub) bid_max FROM campaign_bids WHERE campaign_id=?`).get(s.campaign_id),ch=db.prepare(`SELECT COUNT(DISTINCT nm_id) changed_products,MAX(changed_at) last_bid_change FROM campaign_bid_changes WHERE campaign_id=? AND changed_at BETWEEN ? AND ?`).get(s.campaign_id,`${start} 00:00:00`,`${end} 23:59:59`);return{...s,name:c.name||`Кампания ${s.campaign_id}`,status:c.status||'',type:'CPC',products:b.products||0,bid_min:b.bid_min,bid_max:b.bid_max,changed_products:ch.changed_products||0,last_bid_change:ch.last_bid_change}}).sort((a,b)=>b.spend-a.spend);
   const selected=Number(campaignId)||Number(rows[0]?.campaign_id||0);
-  const products=db.prepare(`SELECT b.*,ch.old_value,ch.new_value,ch.changed_at,(SELECT COUNT(*) FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ?) changes FROM campaign_bids b LEFT JOIN campaign_bid_changes ch ON ch.rowid=(SELECT x.rowid FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ? ORDER BY x.changed_at DESC LIMIT 1) WHERE b.campaign_id=? ORDER BY b.nm_id,b.placement`).all(`${start} 00:00:00`,`${end} 23:59:59`,`${start} 00:00:00`,`${end} 23:59:59`,selected);
+  const rawProducts=db.prepare(`SELECT b.*,ch.old_value,ch.new_value,ch.changed_at,(SELECT COUNT(*) FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ?) changes FROM campaign_bids b LEFT JOIN campaign_bid_changes ch ON ch.rowid=(SELECT x.rowid FROM campaign_bid_changes x WHERE x.campaign_id=b.campaign_id AND x.nm_id=b.nm_id AND x.placement=b.placement AND x.changed_at BETWEEN ? AND ? ORDER BY x.changed_at DESC LIMIT 1) WHERE b.campaign_id=? ORDER BY b.nm_id,b.placement`).all(`${start} 00:00:00`,`${end} 23:59:59`,`${start} 00:00:00`,`${end} 23:59:59`,selected);
+  const currentStats=selected?db.prepare(`SELECT stat_date,views,clicks,orders,CASE WHEN views>0 THEN clicks*100.0/views ELSE 0 END ctr FROM campaign_daily_stats WHERE legal_entity_id=? AND campaign_id=? AND stat_date<=? ORDER BY stat_date DESC LIMIT 1`).get(Number(entityId)||1,selected,end):null;
+  const changeStatsStmt=db.prepare(`SELECT stat_date,views,clicks,orders,CASE WHEN views>0 THEN clicks*100.0/views ELSE 0 END ctr FROM campaign_daily_stats WHERE legal_entity_id=? AND campaign_id=? AND stat_date=?`);
+  const products=rawProducts.map(p=>{const changeDate=p.changed_at?String(p.changed_at).slice(0,10):null,changeStats=changeDate?changeStatsStmt.get(Number(entityId)||1,selected,changeDate):null;return{...p,change_stat_date:changeStats?.stat_date||changeDate,change_views:changeStats?.views??null,change_ctr:changeStats?.ctr??null,change_orders:changeStats?.orders??null,current_stat_date:currentStats?.stat_date||null,current_views:currentStats?.views??null,current_ctr:currentStats?.ctr??null,current_orders:currentStats?.orders??null}});
   return{from:start,to:end,selected_id:selected,rows,products};
 }
 function sharedExport(from,to,entityId){const id=Number(entityId)||1,end=to&&/^\d{4}-\d{2}-\d{2}$/.test(to)?to:ymdMoscow(new Date()),start=from&&/^\d{4}-\d{2}-\d{2}$/.test(from)?from:(()=>{const d=new Date();d.setUTCDate(d.getUTCDate()-6);return ymdMoscow(d)})();return{generated_at:now(),legal_entity_id:id,from:start,to:end,campaigns:db.prepare(`SELECT * FROM campaigns WHERE legal_entity_id=? AND status<>'archived' ORDER BY id`).all(id),daily_stats:db.prepare(`SELECT * FROM campaign_daily_stats WHERE legal_entity_id=? AND stat_date BETWEEN ? AND ? ORDER BY stat_date,campaign_id`).all(id,start,end),bids:db.prepare(`SELECT b.* FROM campaign_bids b JOIN campaigns c ON c.id=b.campaign_id WHERE c.legal_entity_id=? ORDER BY b.campaign_id,b.nm_id,b.placement`).all(id),bid_changes:db.prepare(`SELECT x.* FROM campaign_bid_changes x JOIN campaigns c ON c.id=x.campaign_id WHERE c.legal_entity_id=? AND x.changed_at BETWEEN ? AND ? ORDER BY x.changed_at`).all(id,`${start} 00:00:00`,`${end} 23:59:59`),hourly:db.prepare(`SELECT * FROM hourly_snapshots WHERE legal_entity_id=? AND snapshot_at BETWEEN ? AND ? ORDER BY snapshot_at`).all(id,`${start} 00:00:00`,`${end} 23:59:59`)}}
@@ -666,7 +675,30 @@ function effectiveLegalEntityIds(user){
 }
 function permittedEntityIds(req){if(!req)return null;const user=authenticatedUser(req);if(!user)return[];return effectiveLegalEntityIds(user)}
 function requireEntityAccess(req,id){const entityId=Number(id),exists=db.prepare('SELECT id FROM legal_entities WHERE id=? AND enabled=1').get(entityId);if(!exists)throw httpError(404,'Юрлицо не найдено');const allowed=permittedEntityIds(req);if(Array.isArray(allowed)&&!allowed.includes(entityId))throw httpError(403,'Нет доступа к этому юрлицу');return entityId}
-function listLegalEntities(req=null){const rows=db.prepare('SELECT id,name,enabled,token_enc IS NOT NULL AS token_saved,created_at,updated_at FROM legal_entities WHERE enabled=1 ORDER BY id').all().map(x=>({...x,id:Number(x.id)})),allowed=permittedEntityIds(req);return Array.isArray(allowed)?rows.filter(x=>allowed.includes(x.id)):rows}
+const WB_TOKEN_SECTIONS=[[1,'Контент'],[2,'Аналитика'],[3,'Цены и скидки'],[4,'Маркетплейс'],[5,'Статистика'],[6,'Продвижение'],[7,'Отзывы и вопросы'],[9,'Чат с покупателями'],[10,'Поставки'],[11,'Возвраты'],[12,'Документы'],[13,'Финансы'],[16,'Пользователи']];
+function inspectWbToken(value){
+  const token=String(value||'').trim(),parts=token.split('.');
+  if(parts.length!==3)throw httpError(400,'Некорректный формат API-токена Wildberries');
+  try{
+    const payload=JSON.parse(Buffer.from(parts[1],'base64url').toString('utf8'));
+    const mask=BigInt(payload.s??0);
+    const sections=WB_TOKEN_SECTIONS.filter(([bit])=>(mask&(1n<<BigInt(bit)))!==0n).map(([,name])=>name);
+    if(!sections.length)throw httpError(400,'В API-токене не найдены доступные разделы Wildberries');
+    return{sections,read_only:(mask&(1n<<30n))!==0n};
+  }catch(error){
+    if(error?.status)throw error;
+    throw httpError(400,'Некорректный формат API-токена Wildberries');
+  }
+}
+function listLegalEntities(req=null){
+  const rows=db.prepare('SELECT id,name,enabled,token_enc,created_at,updated_at FROM legal_entities WHERE enabled=1 ORDER BY id').all().map(row=>{
+    let token_sections=[],token_read_only=false;
+    if(row.token_enc)try{const info=inspectWbToken(decrypt(row.token_enc));token_sections=info.sections;token_read_only=info.read_only}catch{}
+    const{token_enc,...safe}=row;
+    return{...safe,id:Number(row.id),token_saved:Boolean(token_enc),token_sections,token_read_only};
+  }),allowed=permittedEntityIds(req);
+  return Array.isArray(allowed)?rows.filter(x=>allowed.includes(x.id)):rows
+}
 function activeEntityId(url,req=null){const requested=Number(url?.searchParams?.get('legal_entity_id'));if(requested)return requireEntityAccess(req,requested);const rows=listLegalEntities(req);if(!rows.length)throw httpError(403,'Пользователю не назначено ни одного юрлица');const preferred=Number(db.prepare('SELECT active_entity_id FROM settings WHERE id=1').get()?.active_entity_id)||1;return rows.some(x=>x.id===preferred)?preferred:rows[0].id}
 function tokenForEntity(id){const entity=db.prepare('SELECT token_enc FROM legal_entities WHERE id=? AND enabled=1').get(Number(id)||1);return decrypt(entity?.token_enc);}
 function normalizeScheduleWindows(value){let rows=value;if(typeof rows==='string')try{rows=JSON.parse(rows)}catch{rows=[]}if(!Array.isArray(rows))return[];return rows.slice(0,12).map(row=>({from:validTime(row?.from,'00:00'),to:validTime(row?.to,'00:00')})).filter(row=>row.from!==row.to)}
